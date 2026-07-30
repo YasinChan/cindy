@@ -79,21 +79,32 @@ function useVisibleOutlineMessageIds(
     return last ? new Set([last]) : EMPTY_ACTIVE_IDS;
   }, [entries]);
   const [visibleIds, setVisibleIds] = useState<ReadonlySet<string>>(fallbackIds);
-  const entriesRef = useRef(entries);
-  entriesRef.current = entries;
+  /**
+   * clientId → 目录项 的映射，只在 entries 变化时重建。
+   *
+   * measure() 每个 scroll / resize tick 都会跑（rAF 调度），而 entries 是**整份会话**的
+   * 索引（长会话上千轮）。在 measure() 里现建这张表等于每帧一次 O(总轮数) 的遍历与分配，
+   * 长会话滚动会卡；而 DOM 查询实际只需要当前渲染出来的那几十个节点。
+   *
+   * 用 useMemo 而不是 useRef + useEffect 填表：effect 在 paint 之后才跑，而下面订阅
+   * scroll 的 effect 挂上就立刻 schedule() 一次，用 effect 填表会让第一次 measure()
+   * 读到空表、在 size === 0 处直接返回，active 刻度要等下一次滚动才亮。
+   */
+  const outlineIndex = useMemo(() => {
+    // 直接 set 而不是 flatMap 出一个中间数组再喂 Map：少一次全量分配，也更好读。
+    const byClientId = new Map<string, { messageId: string; entryIndex: number }>();
+    entries.forEach((entry, entryIndex) => {
+      if (entry.clientId) byClientId.set(entry.clientId, { messageId: entry.messageId, entryIndex });
+    });
+    return { byClientId, total: entries.length };
+  }, [entries]);
   const frameRef = useRef<number | null>(null);
   const frameUsesRafRef = useRef(false);
 
   const measure = useCallback(() => {
     const root = scrollContainerRef.current;
     if (!root) return;
-    const byClientId = new Map(
-      entriesRef.current.flatMap((entry, entryIndex) =>
-        entry.clientId
-          ? [[entry.clientId, { messageId: entry.messageId, entryIndex }] as const]
-          : [],
-      ),
-    );
+    const { byClientId, total } = outlineIndex;
     if (byClientId.size === 0) return;
 
     const rootRect = root.getBoundingClientRect();
@@ -114,7 +125,7 @@ function useVisibleOutlineMessageIds(
       const turn = turns[index];
       const followingTurn = turns[index + 1];
       const isFollowingEntry = followingTurn?.entryIndex === turn.entryIndex + 1;
-      const isLastEntry = turn.entryIndex === entriesRef.current.length - 1;
+      const isLastEntry = turn.entryIndex === total - 1;
       // 长会话可能同时渲染“目标附近”和“会话尾部”两段，中间目录项并不在 DOM。
       // 只有目录里真正相邻的下一轮才能充当区间边界，避免前一段跨过缺口误亮到尾部。
       const rangeBottom = isFollowingEntry
@@ -143,7 +154,7 @@ function useVisibleOutlineMessageIds(
       next.add((nearestTurn?.turn ?? turns[0]).messageId);
     }
     setVisibleIds((current) => (sameIdSet(current, next) ? current : next));
-  }, [scrollContainerRef]);
+  }, [outlineIndex, scrollContainerRef]);
 
   useEffect(() => {
     const root = scrollContainerRef.current;

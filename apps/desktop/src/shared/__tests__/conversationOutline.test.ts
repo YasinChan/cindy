@@ -156,6 +156,35 @@ describe('conversationOutline', () => {
     ).toBe('第一段');
   });
 
+  /**
+   * 正文本身就是 JSON 字面量的提问（编码场景很常见：粘一段 config、发 {"cmd":"build"}、
+   * 发一个数组）不能被当成结构化消息内容再解析一遍 —— 那会解出一个没有 text/content
+   * 字段的对象、预览变空，于是这条 turn 连同它的跳转锚点一起从大纲里消失。
+   */
+  it('正文是 JSON 字面量的提问不被丢掉', () => {
+    for (const literal of ['{"cmd":"build"}', '[1,2,3]', '{"a":{"b":1}}', '[]', '{}']) {
+      expect(normalizeConversationOutlinePreview(literal)).toBe(literal);
+    }
+    // 原生投影行：preview 已经是可见文本，不该再被解析
+    expect(
+      conversationOutlineEntryFromRow({
+        messageId: 'm-json',
+        clientId: 'c-json',
+        createdAt: 1_000,
+        preview: '{"cmd":"build"}',
+      }),
+    ).toMatchObject({ messageId: 'm-json', preview: '{"cmd":"build"}' });
+    // 旧主机行：content 是存库的 JSON 包裹，里面的 text 才是可见文本，仍要正常解包
+    expect(
+      conversationOutlineEntryFromRow({
+        id: 'legacy-json',
+        role: 'user',
+        createdAt: 2_000,
+        content: JSON.stringify({ text: '{"cmd":"build"}', images: [] }),
+      }),
+    ).toMatchObject({ messageId: 'legacy-json', preview: '{"cmd":"build"}' });
+  });
+
   it('回复预览带过来的隐藏续跑指令不渲染', () => {
     expect(
       normalizeConversationOutlineReplyPreview('[UI_ACTION_TRIGGER] continue after error'),
@@ -198,7 +227,17 @@ describe('conversationOutline', () => {
     expect(normalizeConversationOutlinePreview('1')).toBe('1');
     expect(normalizeConversationOutlinePreview('true')).toBe('true');
     expect(normalizeConversationOutlinePreview('null')).toBe('null');
-    expect(normalizeConversationOutlinePreview('"quoted"')).toBe('quoted');
+    // 可见文本入口不再脱引号：用户真打了一对引号就该看到引号。
+    // 「存库列里 JSON 编码过的字符串要脱引号」是另一条路径的职责，下面单独断言。
+    expect(normalizeConversationOutlinePreview('"quoted"')).toBe('"quoted"');
+    expect(
+      conversationOutlineEntryFromRow({
+        id: 'stored-json-string',
+        role: 'user',
+        createdAt: 3_000,
+        content: JSON.stringify('quoted'),
+      })?.preview,
+    ).toBe('quoted');
     expect(
       shouldShowConversationOutline(
         Array.from({ length: 3 }, (_, index) => ({

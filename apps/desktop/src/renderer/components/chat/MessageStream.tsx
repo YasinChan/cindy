@@ -3509,7 +3509,10 @@ export function MessageStream({
             {sessionId ? (
               <SelectionQuoteButton sessionId={sessionId} containerRef={scrollRef} />
             ) : null}
-            {onConversationOutlineSelect ? (
+            {/* 隐藏时不挂载:导轨在 effect 里挂 scroll / resize 监听并 observe 滚动容器,
+                即便 render 返回 null,这些监听与每次滚动的 rAF 量测仍在跑。窄布局 /
+                compact / Orca / 非 owning route 下没有任何理由付这份开销。 */}
+            {onConversationOutlineSelect && showConversationOutline ? (
               <ConversationOutlineRail
                 ref={conversationOutlineRailRef}
                 entries={conversationOutline}

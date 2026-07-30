@@ -22,23 +22,38 @@ export interface ConversationOutlineCursor {
   rowid?: number;
 }
 
+/**
+ * turn-index 投影的请求形状。
+ *
+ * 几个字段被钉死成唯一可接受值，而不是照抄常规 history 的宽类型：这个投影把
+ * 「只要未 rewind 的 user 行、升序」写死在 SQL 里，不消费 workdir / agentKind /
+ * includeRewound / 非 user 的 roles，main 侧收到就报 INVALID_PARAMS（见
+ * localDb/ipc/history.ts 的守卫）。类型跟着运行时一起收紧，这样写错的调用编译期
+ * 就挡住，而不是跑起来才拿到错误。
+ */
 export interface ConversationOutlineHistoryRequest {
   sessionId: string;
-  workdir: string | null;
+  /** 本投影不按工作目录筛选。 */
+  workdir: null;
   fromMs: number | null;
   toMs: number | null;
-  agentKind: 'cc' | 'codex' | null;
+  /** 本投影不按 agent 引擎筛选。 */
+  agentKind: null;
+  /** null 与 ['user'] 等价（本投影只索引 user turn）。 */
   roles: ['user'] | null;
+  /** 本投影永不返回已 rewind 的行。 */
   includeRewound: false;
   limit: number;
   cursor: ConversationOutlineCursor | null;
+  /** 回复预览的分组依赖升序扫描，desc 会被 main 侧拒掉。 */
   order: 'asc';
   /**
    * `turn-index` is an additive projection on the existing history channel.
    * Older hosts ignore this field and return the regular HistoryPage shape;
    * renderer code deliberately accepts both shapes.
    */
-  projection?: ConversationOutlineProjection;
+  projection?: 'turn-index';
+  /** 仅对旧被控端的降级投影有意义（原生投影返回的是算好的预览）。 */
   contentCharLimit: number | null;
 }
 
@@ -105,7 +120,11 @@ function parseJsonString(value: string): unknown {
   }
 }
 
-function contentText(value: unknown): string {
+/**
+ * 解包**存库的 content 列**。它确实可能是 JSON：`{text, images}`、text/image 块数组、
+ * 或被 JSON 字符串包裹的结构。只有拿到原始存储值时才该调它。
+ */
+function decodeStoredContent(value: unknown): string {
   if (typeof value === 'string') {
     const parsed = parseJsonString(value);
     if (parsed === value) return value;
@@ -115,7 +134,7 @@ function contentText(value: unknown): string {
     if (parsed === null || typeof parsed === 'number' || typeof parsed === 'boolean') {
       return value;
     }
-    return contentText(parsed);
+    return decodeStoredContent(parsed);
   }
   if (Array.isArray(value)) {
     return value
@@ -136,6 +155,19 @@ function contentText(value: unknown): string {
     if (typeof record.content === 'string') return record.content;
   }
   return '';
+}
+
+/**
+ * 归一**已经是用户可见文本**的输入：preview / replyPreview / ChatMessage.content /
+ * SQL 已解码的 text。
+ *
+ * 关键是字符串**原样返回、不再解析 JSON**。正文本身就是 JSON 字面量的提问在编码场景
+ * 很常见（粘一段 config、发 `{"cmd":"build"}`、发一个数组），再解析一遍会解出一个没有
+ * text/content 字段的对象、预览变空，于是这条 turn 连同它的跳转锚点一起从大纲里消失。
+ * 非字符串（历史 wire payload 可能已经被上游 JSON.parse 成对象/数组）才退回按存储值解包。
+ */
+function asVisibleText(value: unknown): string {
+  return typeof value === 'string' ? value : decodeStoredContent(value);
 }
 
 function agentMetaRecord(value: unknown): Record<string, unknown> | null {
@@ -193,7 +225,7 @@ export function normalizeConversationOutlinePreview(
   value: unknown,
   maxChars = DEFAULT_PREVIEW_LIMIT,
 ): string {
-  const text = contentText(value);
+  const text = asVisibleText(value);
   if (!text || isSyntheticTriggerPreview(text)) return '';
   // 归一到拿到第一条非空行为止:后面的行不参与显示，不必逐行跑正则。
   let firstLine = '';
@@ -228,7 +260,7 @@ export function normalizeConversationOutlineReplyPreview(
   value: unknown,
   maxChars = CONVERSATION_OUTLINE_REPLY_PREVIEW_LIMIT,
 ): string {
-  const text = contentText(value);
+  const text = asVisibleText(value);
   if (!text || isSyntheticTriggerPreview(text)) return '';
   // 攒过 maxChars 就停:再往后折行只会被下面的 slice 丢掉，而"要不要加省略号"这个
   // 唯一还需要的信息，长度一旦**严格大于** maxChars 就已经定了（恰好等于 maxChars
@@ -287,7 +319,7 @@ export function isConversationOutlineTurnBoundary(row: ConversationOutlineFollow
   if (row.role !== 'user') return false;
   const meta = agentMetaRecord(row.agentMeta);
   if (meta?.autoResume === true || meta?.delivery === 'steer') return false;
-  const text = contentText(row.text);
+  const text = asVisibleText(row.text);
   return !isSyntheticTriggerText(text);
 }
 
@@ -356,7 +388,9 @@ export function isHiddenConversationOutlineRow(row: ConversationOutlineRow): boo
   // Native turn-index rows carry only `preview`; legacy history rows carry
   // `content`.  Prefer the projection when present so new rows are not
   // mistaken for attachment-only hidden rows.
-  const visibleText = row.preview !== undefined ? row.preview : row.content;
+  // preview 已是可见文本，原样判；content 是存库列，先解包再判。
+  const visibleText =
+    row.preview !== undefined ? row.preview : decodeStoredContent(row.content);
   return normalizeConversationOutlinePreview(visibleText) === '';
 }
 
@@ -377,7 +411,7 @@ export function conversationOutlineEntryFromRow(
   const preview =
     typeof row.preview === 'string'
       ? normalizeConversationOutlinePreview(row.preview)
-      : normalizeConversationOutlinePreview(row.content);
+      : normalizeConversationOutlinePreview(decodeStoredContent(row.content));
   if (!preview) return null;
   const replyPreview = normalizeConversationOutlineReplyPreview(row.replyPreview);
   return {
