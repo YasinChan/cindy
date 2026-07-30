@@ -4544,6 +4544,11 @@
     "transcriptKeptOverlay": "{{message}} 지금까지 인식된 텍스트는 유지했습니다. 복사해서 이어가세요."
   },
   "chat": {
+    "conversationOutline": {
+      "navAria": "대화 목차",
+      "itemAria": "{{index}}번째 턴으로 이동: {{preview}}",
+      "jumpFailed": "이 턴으로 이동하지 못했습니다."
+    },
     "askUserQuestion": {
       "skippedAnswer": "건너뜀"
     },

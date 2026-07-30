@@ -4545,6 +4545,11 @@
     "transcriptKeptOverlay": "{{message}} The text recognized so far was kept — copy it to continue."
   },
   "chat": {
+    "conversationOutline": {
+      "navAria": "Conversation outline",
+      "itemAria": "Jump to turn {{index}}: {{preview}}",
+      "jumpFailed": "Could not jump to this turn."
+    },
     "askUserQuestion": {
       "skippedAnswer": "Skipped"
     },

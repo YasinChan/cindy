@@ -3225,6 +3225,12 @@ interface ElectronAPI {
         request: import('../shared/conversationSearch').ConversationSearchRequest,
       ) => Promise<import('../shared/conversationSearch').ConversationSearchResponse>;
     };
+    history: {
+      /** 读取当前对话的轻量 user-turn 目录索引，不返回正文或工具输出。 */
+      turnIndex: (
+        request: import('../shared/conversationOutline').ConversationOutlineHistoryRequest,
+      ) => Promise<import('../shared/conversationOutline').ConversationOutlineHistoryPage>;
+    };
     recentWorkdirs: {
       /** 列出"最近工作目录"按 lastUsedAt desc;归档/删除 session 都不影响本列表。 */
       list: () => Promise<Array<{ path: string; lastUsedAt: string; exists: boolean }>>;

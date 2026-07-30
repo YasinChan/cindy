@@ -30,6 +30,10 @@ import {
 import { createPortal } from 'react-dom';
 import { GitFork } from 'lucide-react';
 import { SelectionQuoteButton } from './SelectionQuoteButton';
+import {
+  ConversationOutlineRail,
+  type ConversationOutlineRailHandle,
+} from './ConversationOutlineRail';
 import { useTranslation } from 'react-i18next';
 import { findMessageTodoInsertions, isAgentPlanToolName } from '@cindy/maker-shared/message-render';
 
@@ -191,6 +195,7 @@ import {
 } from './autoFollowIntent';
 import { useNavigationKeyListener } from './useNavigationKeyListener';
 import { suppressScrollbarActivation } from '@/lib/scrollbarAutoHide';
+import type { ConversationOutlineEntry } from '../../../shared/conversationOutline';
 
 interface MessageStreamProps {
   /** Active session id — used to reset scroll state on session switch. */
@@ -232,6 +237,14 @@ interface MessageStreamProps {
   focusMessageClientId?: string | null;
   /** Incremented by the parent for each search navigation, including repeated hits. */
   focusMessageRequestId?: number;
+  /** Search keeps a highlight; outline navigation only moves the viewport. */
+  focusMessageSource?: 'search' | 'outline';
+  /** Lightweight DB-backed user-turn index, kept outside the message render window. */
+  conversationOutline?: readonly ConversationOutlineEntry[];
+  showConversationOutline?: boolean;
+  onConversationOutlineSelect?: (entry: ConversationOutlineEntry) => void | Promise<void>;
+  /** 用户接管滚动时，取消父级尚未完成的搜索/目录异步定位。 */
+  onFocusNavigationCancel?: () => void;
   /** Source marker shown for sessions forked from another conversation. */
   forkOrigin?: {
     parentSessionId: string;
@@ -2140,6 +2153,11 @@ export function MessageStream({
   contentWidth,
   focusMessageClientId,
   focusMessageRequestId,
+  focusMessageSource = 'search',
+  conversationOutline = [],
+  showConversationOutline = false,
+  onConversationOutlineSelect,
+  onFocusNavigationCancel,
   forkOrigin,
   onOpenForkOrigin,
 }: MessageStreamProps) {
@@ -2159,6 +2177,13 @@ export function MessageStream({
   // 的全局 querySelector 找锚点用。
   const scrollRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const conversationOutlineRailRef = useRef<ConversationOutlineRailHandle>(null);
+  const cancelFocusNavigationForUserTakeover = useCallback(() => {
+    // 父级 generation 负责阻止慢请求回来重新 focus；导轨 ref 负责立即解除
+    // pending active。两层都要取消，视口与 active 才不会在超时窗口内失步。
+    conversationOutlineRailRef.current?.cancelSelection();
+    onFocusNavigationCancel?.();
+  }, [onFocusNavigationCancel]);
   /** 渲染 item 的内层 flex 容器 —— 其 children 与 visibleRenderItems 按索引一一对应,
    *  「按条目相对定位」的还原逻辑靠它反查视口顶端那条 item 的 DOM 节点。 */
   const itemsRef = useRef<HTMLDivElement>(null);
@@ -2226,6 +2251,12 @@ export function MessageStream({
   } | null>(null);
   const focusScrollTimerRef = useRef<number | null>(null);
   const focusHighlightTimerRef = useRef<number | null>(null);
+  // 目录跳转要复用下面两个能力（抑制「上一条提问」chip、抑制 chip-jump 期间的
+  // expand/load），但它们声明在本 effect 之后。用 ref 间接引用而不是把声明上移：
+  // 少动既有代码的结构，也不用把它们加进 effect 依赖。默认空实现，挂载后由各自
+  // 的 effect 填入。
+  const suppressPrevJumpAfterClickRef = useRef<() => void>(() => undefined);
+  const beginChipJumpSuppressionRef = useRef<() => void>(() => undefined);
   useEffect(
     () => () => {
       if (focusScrollTimerRef.current !== null) {
@@ -2367,8 +2398,10 @@ export function MessageStream({
   }, [defaultWindowItems, firstVisibleItemKey, visibleRenderItems.length, allRenderItems.length]);
 
   useLayoutEffect(() => {
+    // source 进 key：同一条消息既可能被搜索命中、又可能被目录点到，两者的
+    // 落地行为不同（高亮 vs 只移动视口），不能被幂等键当成同一次请求吞掉。
     const focusRequestKey = focusMessageClientId
-      ? `${focusMessageRequestId ?? 0}:${focusMessageClientId}`
+      ? `${focusMessageSource}:${focusMessageRequestId ?? 0}:${focusMessageClientId}`
       : null;
     if (!focusMessageClientId || !focusRequestKey) {
       lastAppliedFocusRef.current = null;
@@ -2397,6 +2430,21 @@ export function MessageStream({
       return;
     }
     lastMissingFocusRef.current = null;
+    const isOutlineNavigation = focusMessageSource === 'outline';
+    if (isOutlineNavigation) {
+      // 目录是主动导航，不该留下或复用搜索态高亮。同时必须关掉 auto-follow，
+      // 否则同 commit 的 pin-to-bottom 会把视口抢回尾部。
+      setHighlightMessageClientId(null);
+      restoringRef.current = false;
+      isNearBottomRef.current = false;
+      setIsNearBottom(false);
+      // 跳到旧 turn 后还要显式点亮 jump-down chip：它只在 handleScroll 的
+      // 「非 programmatic」分支里更新，而本次跳转全程 programmatic、之后又没有
+      // 新的 scroll 事件——不补这一下，用户跳完就没有回到最新消息的入口。
+      setShowJumpDown(true);
+      suppressPrevJumpAfterClickRef.current();
+      beginChipJumpSuppressionRef.current();
+    }
     if (!visibleRenderItems.some((item) => item.key === targetKey)) {
       setFirstVisibleItemKey(targetKey);
       return;
@@ -2425,6 +2473,15 @@ export function MessageStream({
     if (focusHighlightTimerRef.current !== null) {
       window.clearTimeout(focusHighlightTimerRef.current);
     }
+    if (isOutlineNavigation) {
+      // 目录不点高亮（主动导航不需要「命中标记」），只在平滑滚动大致落定后
+      // 复位 programmatic 标志，让后续用户滚动能被正确识别。
+      focusScrollTimerRef.current = window.setTimeout(() => {
+        programmaticScrollRef.current = false;
+        focusScrollTimerRef.current = null;
+      }, 800);
+      return;
+    }
     // 高亮时机:等平滑滚动**落定后**再点亮,避免目标还在半途就提前闪高亮(用户反馈)。
     // 优先用 scrollend 精确对齐;拿不到(不支持 / 目标已在视口内滚动距离为 0 不触发)时用兜底延时。
     // 点亮后**不再自动淡出**——停在搜索命中处,直到下次跳转覆盖或切会话(满足「搜索态高亮不消失」)。
@@ -2450,7 +2507,13 @@ export function MessageStream({
     return () => {
       root.removeEventListener('scrollend', applyHighlight);
     };
-  }, [allRenderItems, focusMessageClientId, focusMessageRequestId, visibleRenderItems]);
+  }, [
+    allRenderItems,
+    focusMessageClientId,
+    focusMessageRequestId,
+    focusMessageSource,
+    visibleRenderItems,
+  ]);
 
   // 会话内全部图片的有序 src(全量,来自未裁剪的 allRenderItems),下发给
   // ImageLightbox 做翻图。基于全量而非 visibleRenderItems,这样计数 / 翻页
@@ -2774,6 +2837,22 @@ export function MessageStream({
       chipJumpClearTimerRef.current = null;
     }
   }, []);
+  // 目录跳转同样是长距离 smooth scroll，路径穿过顶部触发区时不该被误读成
+  // 「继续加载历史」。抽成 callback 供 chip 与目录两条路径共用；用 ref 暴露给
+  // 声明更早的 focus effect（见那里的注释）。
+  const beginChipJumpSuppression = useCallback(() => {
+    chipJumpInProgressRef.current = true;
+    if (chipJumpClearTimerRef.current !== null) {
+      window.clearTimeout(chipJumpClearTimerRef.current);
+    }
+    chipJumpClearTimerRef.current = window.setTimeout(() => {
+      chipJumpClearTimerRef.current = null;
+      clearChipJumpSuppression();
+    }, CHIP_JUMP_SAFETY_MS);
+  }, [clearChipJumpSuppression]);
+  useEffect(() => {
+    beginChipJumpSuppressionRef.current = beginChipJumpSuppression;
+  }, [beginChipJumpSuppression]);
   useEffect(() => {
     return () => {
       if (chipJumpClearTimerRef.current !== null) {
@@ -2834,6 +2913,7 @@ export function MessageStream({
     // wheel/touchstart 挂在 scroll 容器上(与上 chip 抑制对称)。容器不可滚时
     // 不会产生 scroll 事件,所以用户继续向上滚动的意图必须在这里接住。
     const onWheel = (event: WheelEvent) => {
+      cancelFocusNavigationForUserTakeover();
       clearChipJumpSuppression();
       if (event.deltaY < 0) {
         if (hasNestedScrollableAncestorThatCanScrollUp(root, event.target)) return;
@@ -2851,6 +2931,7 @@ export function MessageStream({
       }
     };
     const onTouchStart = (event: TouchEvent) => {
+      cancelFocusNavigationForUserTakeover();
       clearChipJumpSuppression();
       userHistoryTouchStartYRef.current = event.touches[0]?.clientY ?? null;
     };
@@ -2887,12 +2968,18 @@ export function MessageStream({
       root.removeEventListener('touchend', onTouchEnd);
       root.removeEventListener('touchcancel', onTouchEnd);
     };
-  }, [clearChipJumpSuppression, triggerUserIntentFill, unpinAutoFollowForUserUpIntent]);
+  }, [
+    clearChipJumpSuppression,
+    cancelFocusNavigationForUserTakeover,
+    triggerUserIntentFill,
+    unpinAutoFollowForUserUpIntent,
+  ]);
   useEffect(() => {
     const onHistoryNavigationKey = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
       if (!HISTORY_NAVIGATION_KEYS.has(event.key)) return;
       if (isEditableKeyboardTarget(event.target)) return;
+      cancelFocusNavigationForUserTakeover();
       clearChipJumpSuppression();
       const el = scrollRef.current;
       if (
@@ -2907,7 +2994,12 @@ export function MessageStream({
     return () => {
       window.removeEventListener('keydown', onHistoryNavigationKey);
     };
-  }, [clearChipJumpSuppression, triggerUserIntentFill, unpinAutoFollowForUserUpIntent]);
+  }, [
+    clearChipJumpSuppression,
+    cancelFocusNavigationForUserTakeover,
+    triggerUserIntentFill,
+    unpinAutoFollowForUserUpIntent,
+  ]);
   useNavigationKeyListener(clearChipJumpSuppression);
 
   const pinToBottom = useCallback(() => {
@@ -2930,6 +3022,13 @@ export function MessageStream({
   //   - 原生 smooth 由浏览器接管（~300ms），不手写 rAF
   //   - 动画期间 ResizeObserver 仍可正常 pinToBottom，auto-follow 无缝接入
   const scrollToBottomSmooth = useCallback(() => {
+    // 点击回到底部是明确的新导航命令，必须先让在飞的旧目录请求失效；否则
+    // device-link 慢响应返回后仍会重新 focus 旧 turn，把用户再次拉离底部。
+    cancelFocusNavigationForUserTakeover();
+    // 同时解除跳转抑制窗口：本次意图就是「待在底部」，而抑制窗口正好挡着
+    // auto-follow 的 pin。不解除的话，3 秒内容高度再增长（异步 settle / 流式）
+    // 就不会被重新钉到底，用户会停在离底部一段距离的地方。
+    clearChipJumpSuppression();
     const el = scrollRef.current;
     if (!el) return;
     setUnreadCount(0);
@@ -2937,7 +3036,7 @@ export function MessageStream({
     isNearBottomRef.current = true;
     programmaticScrollRef.current = true;
     el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
-  }, []);
+  }, [cancelFocusNavigationForUserTakeover, clearChipJumpSuppression]);
 
   // F2: messages diff → 按角色累计 unreadCount
   //   - 用 Set 做 O(n) diff，流式 token 追加（同一 clientId 的 content 变化）不计数
@@ -2997,7 +3096,10 @@ export function MessageStream({
       lastUserMsgIdRef.current = lastUserMsg.clientId;
       isNearBottomRef.current = true;
       pinToBottom();
-    } else if (isNearBottomRef.current) {
+    } else if (isNearBottomRef.current && !chipJumpInProgressRef.current) {
+      // 跳转期间不 pin:目录/搜索跳转是主动导航,内容高度增长(补齐 prepend、异步 settle)
+      // 不代表"用户想看最新"。抑制窗口由 beginChipJumpSuppression 开启、CHIP_JUMP_SAFETY_MS
+      // 兜底关闭,用户一 wheel/touch/keydown 立即解除,所以流式跟随不受影响。
       pinToBottom();
     }
 
@@ -3044,6 +3146,9 @@ export function MessageStream({
         return;
       }
       if (performance.now() < suppressPinUntil) return;
+      // 与上面的 pin effect 同一道闸:跳转期间的异步高度 settle 不得把视口拽回底部
+      // (实测就是它在 scrollIntoView 起步 35ms 后硬跳到底,把目录跳转吞掉的)。
+      if (chipJumpInProgressRef.current) return;
       if (isNearBottomRef.current) pinToBottom();
     });
     ro.observe(content);
@@ -3175,6 +3280,15 @@ export function MessageStream({
 
     if (!programmaticScrollRef.current) {
       // 用户手动滚动 = 接管浏览,退出「还原中」,后续恢复正常 auto-follow 判定。
+      //
+      // 这里**刻意不**取消父级的搜索/目录定位(`onFocusNavigationCancel`)。
+      // 裸 scroll 事件分不清「用户拖滚动条」和「布局变化引起的滚动」:跳转时的历史
+      // 补齐会往顶部 prepend 几百行,浏览器 scroll anchoring 随即调整 scrollTop
+      // (F-SYNC-2 检测到 anchoring 已生效那条分支不设 programmaticScrollRef),于是
+      // 定位会被它自己触发的加载取消掉,表现为「点了没反应」。
+      // 真实接管路径已被事件层全覆盖:wheel / touchstart / 键盘 / 回到底部 chip。
+      // 唯一没覆盖的是纯拖滚动条,代价远小于跳转静默失败。
+      // (同一道理见本 handler 上方注释:解除跟随也不靠 scroll 距离判定。)
       restoringRef.current = false;
       // 持续保存当前浏览位置(rAF 节流,DOM 必然存活)。不依赖 unmount 时机,
       // 规避「React passive cleanup 在 DOM 移除后才跑、量测拿到 null」的坑。
@@ -3321,16 +3435,15 @@ export function MessageStream({
     // 把 viewport 拽飞。设 ref 让 handleScroll 跳过那分支。解抑靠 wheel/touch/
     // keydown(在上面 useEffect 里挂的监听),用户一动手就过去,不会卡"用 chip
     // 连点上翻"或"跳完立刻 wheel 看更老历史"。
-    chipJumpInProgressRef.current = true;
-    if (chipJumpClearTimerRef.current !== null) {
-      window.clearTimeout(chipJumpClearTimerRef.current);
-    }
-    chipJumpClearTimerRef.current = window.setTimeout(() => {
-      chipJumpClearTimerRef.current = null;
-      clearChipJumpSuppression();
-    }, CHIP_JUMP_SAFETY_MS);
+    beginChipJumpSuppression();
     el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }, [prevUserMsgId, suppressAfterClick, clearChipJumpSuppression]);
+  }, [prevUserMsgId, suppressAfterClick, beginChipJumpSuppression]);
+
+  // render 体内直接赋值 ref 属于副作用（StrictMode 双调用 / 被丢弃的并发渲染都会
+  // 写进去），放进 effect。focus effect 读它的时机永远在 commit 之后。
+  useEffect(() => {
+    suppressPrevJumpAfterClickRef.current = suppressAfterClick;
+  }, [suppressAfterClick]);
 
   const prevPreview = prevUserMsgId ? firstNonEmptyLine(previewById.get(prevUserMsgId) ?? '') : '';
 
@@ -3395,6 +3508,25 @@ export function MessageStream({
           绑定本流的滚动容器:协同模式多流并存时,选区归属按各自容器判定。 */}
             {sessionId ? (
               <SelectionQuoteButton sessionId={sessionId} containerRef={scrollRef} />
+            ) : null}
+            {onConversationOutlineSelect ? (
+              <ConversationOutlineRail
+                ref={conversationOutlineRailRef}
+                entries={conversationOutline}
+                scrollContainerRef={scrollRef}
+                show={showConversationOutline}
+                onSelect={onConversationOutlineSelect}
+                style={{
+                  // 宽屏贴聊天区左侧固定 24px，不跟着正文左边缘往右飘（否则窗口越宽
+                  // 导轨越往中间跑）；窄屏时 min() 让它退到正文左边 32px 以外，最后
+                  // 4px 下限兜住极窄窗口不溢出容器。
+                  // 导轨是滚动容器外的 sibling，不参与 content/items 高度计算。
+                  left: `max(4px, min(24px, calc(50% - ${(contentWidth ?? 880) / 2 + 32}px)))`,
+                  // 48 / 16 / 96 都落在 §5 的 8px 基准刻度上（原先 top 是 52，不在刻度上）。
+                  top: 48,
+                  bottom: Math.max(resolvedBottomPadding + 16, 96),
+                }}
+              />
             ) : null}
             {/*
         原生滚动容器:overflow-y-auto + overflow-x-hidden。

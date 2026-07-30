@@ -55,6 +55,17 @@
       "note": "远端主机上由 Cindy 管理的 Codex 凭证目录（~/.xdt-server/v1/codex-home/），与用户本机 ~/.codex 相区分。四语统一保留英文原词（home 小写），避免各语言自造「Codex 主目录」等不同说法；syncAuth 与 codexAuthMissing 等远端登录态文案使用。"
     },
     {
+      "id": "conversation-outline",
+      "status": "proposed",
+      "en": "Conversation outline",
+      "translations": {
+        "zh-CN": "对话大纲",
+        "ja": "会話の目次",
+        "ko": "대화 목차"
+      },
+      "note": "聊天区左侧那列细刻度导轨（每个 user turn 一根，点击跳转）的可访问名。zh-CN 取「大纲」而非「目录」：后者与已裁决条目 Directory→目录 撞词，而「大纲」是这个语境的通行译法（VSCode 中文版的 Outline 视图、Word 的大纲视图）。ja/ko 的「目次 / 목차」是 table of contents 义，与「大纲」同向且不与任何已裁决条目冲突，故不改。待定的只剩英文侧是否统一为 Outline（当前 en 用 Conversation outline，仅 desktop:chat.conversationOutline.* 三条文案使用）。"
+    },
+    {
       "id": "wechat",
       "status": "proposed",
       "en": "WeChat",

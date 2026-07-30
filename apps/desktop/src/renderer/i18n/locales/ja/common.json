@@ -4544,6 +4544,11 @@
     "transcriptKeptOverlay": "{{message}}（ここまで認識したテキストは保持しており、コピーして続けられます）"
   },
   "chat": {
+    "conversationOutline": {
+      "navAria": "会話の目次",
+      "itemAria": "{{index}} 番目のターンに移動: {{preview}}",
+      "jumpFailed": "このターンに移動できませんでした。"
+    },
     "askUserQuestion": {
       "skippedAnswer": "スキップ済み"
     },

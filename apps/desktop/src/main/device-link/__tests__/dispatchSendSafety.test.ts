@@ -9,7 +9,13 @@
  * 只 mock electron(app)+ logger;subscriptions 用真实模块(注册控制端订阅)。
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { DeviceLinkError, MAX_FRAME_BYTES, PROTOCOL_VERSION, type InvokeResultPayload } from '@cindy/device-link';
+import {
+  DeviceLinkError,
+  DL_HISTORY_MESSAGES_CHANNEL,
+  MAX_FRAME_BYTES,
+  PROTOCOL_VERSION,
+  type InvokeResultPayload,
+} from '@cindy/device-link';
 
 vi.mock('electron', () => ({
   app: {
@@ -316,6 +322,111 @@ describe('[14] sendInvokeResultSafe — 结果超限兜底', () => {
       const clientIds = (compact.result as Array<{ clientId: string }>).map((message) => message.clientId);
       expect(clientIds).toContain('anchor-client');
     }
+  });
+
+  it('turn-index 超帧裁项后用实际尾项重算 nextCursor，不跳过未返回目录项', () => {
+    const sendInvokeResult = vi.fn().mockImplementationOnce(() => {
+      throw tooLarge();
+    });
+    const client = mkClient({ sendInvokeResult });
+    const items = Array.from({ length: 4_200 }, (_, index) => ({
+      messageId: `message-${index}`,
+      clientId: `client-${index}`,
+      rowid: index + 1,
+      createdAt: 10_000 + index,
+      preview: 'p'.repeat(1_000),
+    }));
+    const big: InvokeResultPayload = {
+      ok: true,
+      result: {
+        items,
+        nextCursor: {
+          createdAt: items[items.length - 1].createdAt,
+          id: items[items.length - 1].messageId,
+          rowid: items[items.length - 1].rowid,
+        },
+        hasMore: false,
+      },
+    };
+
+    expect(() =>
+      __testing.sendInvokeResultSafe(
+        client as never,
+        'ctrl-1',
+        'req-outline',
+        big,
+        DL_HISTORY_MESSAGES_CHANNEL,
+        [{ projection: 'turn-index' }],
+      ),
+    ).not.toThrow();
+
+    expect(sendInvokeResult).toHaveBeenCalledTimes(2);
+    const compact = sendInvokeResult.mock.calls[1][2] as InvokeResultPayload;
+    expect(invokeResultFrameBytes('ctrl-1', 'req-outline', compact)).toBeLessThan(MAX_FRAME_BYTES);
+    expect(compact.ok).toBe(true);
+    if (compact.ok) {
+      const page = compact.result as {
+        items: Array<{
+          messageId: string;
+          rowid: number;
+          createdAt: number;
+          preview: string;
+        }>;
+        nextCursor: { id: string; rowid: number; createdAt: number };
+        hasMore: boolean;
+      };
+      expect(page.items.length).toBeGreaterThan(0);
+      expect(page.items.length).toBeLessThan(items.length);
+      const actualLast = page.items[page.items.length - 1];
+      expect(page.nextCursor).toEqual({
+        createdAt: actualLast.createdAt,
+        id: actualLast.messageId,
+        rowid: actualLast.rowid,
+      });
+      expect(page.hasMore).toBe(true);
+      // 裁剪只丢项、不改项：被控端返回的目录项已在 shared 侧归一过，压缩层不再
+      // 二次加工（原先这里断言 preview 被重新夹到 512，那层转换已随死代码删除）。
+      expect(page.items[0].preview).toBe('p'.repeat(1_000));
+    }
+  });
+
+  /**
+   * 未超帧的 turn-index 页原样发送:被控端返回的目录项已在 shared 侧归一过
+   * （preview ≤ 140 / replyPreview ≤ 160，见 conversationOutline.ts），压缩层不再
+   * 净化一遍自己的产物。这条防的是有人重新插入剥字段或再归一的步骤。
+   */
+  it('原生 turn-index 投影原样送过隧道，replyPreview 不被剥掉', () => {
+    const sendInvokeResult = vi.fn();
+    const client = mkClient({ sendInvokeResult });
+    const items = [
+      {
+        messageId: 'db-message-1',
+        clientId: 'client-1',
+        rowid: 3,
+        createdAt: 12_000,
+        preview: '连线为什么断了',
+        replyPreview: '连线绝对定位在滚动容器上，所以窗口一变高它就跟不上了。',
+      },
+    ];
+    const nativePage: InvokeResultPayload = {
+      ok: true,
+      result: { items, nextCursor: null, hasMore: false },
+    };
+
+    __testing.sendInvokeResultSafe(
+      client as never,
+      'ctrl-1',
+      'req-outline-reply',
+      nativePage,
+      DL_HISTORY_MESSAGES_CHANNEL,
+      [{ projection: 'turn-index' }],
+    );
+
+    expect(sendInvokeResult).toHaveBeenCalledTimes(1);
+    expect(sendInvokeResult.mock.calls[0][2]).toEqual({
+      ok: true,
+      result: { items, nextCursor: null, hasMore: false },
+    });
   });
 
   it('非消息页首发抛 PAYLOAD_TOO_LARGE → 重发紧凑 {ok:false} 错误结果(沿用原 code),不冒泡', () => {

@@ -4544,6 +4544,11 @@
     "transcriptKeptOverlay": "{{message}}（识别出的文字已经保留，可以复制后继续用）"
   },
   "chat": {
+    "conversationOutline": {
+      "navAria": "对话大纲",
+      "itemAria": "跳转到对话中的第 {{index}} 条内容：{{preview}}",
+      "jumpFailed": "无法跳转到这条内容。"
+    },
     "askUserQuestion": {
       "skippedAnswer": "已跳过"
     },

@@ -23,6 +23,12 @@ import type { Message, Session } from '@/lib/ccAgent.types';
 import * as messageService from '@/lib/messageService';
 import * as sessionService from '@/lib/sessionService';
 import { extractIpcError } from '@/utils/ipcError';
+import {
+  buildConversationOutline,
+  type ConversationOutlineCursor,
+  type ConversationOutlineEntry,
+  type ConversationOutlineHistoryRequest,
+} from '../../shared/conversationOutline';
 
 type FullMaker = typeof window.electronAPI.maker;
 
@@ -259,6 +265,177 @@ export function listSessionBackgroundTasksFor(
   ).catch(() => ({ tasks: [] }));
 }
 
+const CONVERSATION_OUTLINE_PAGE_SIZE = 100;
+const CONVERSATION_OUTLINE_MAX_PAGES = 256;
+
+export interface ListConversationOutlineOptions {
+  signal?: AbortSignal;
+  /** 从这个权威尾游标之后读取新增 user turn；null 表示从会话头开始。 */
+  cursor?: ConversationOutlineCursor | null;
+}
+
+export interface ConversationOutlineLoadResult {
+  entries: ConversationOutlineEntry[];
+  /** 已读到的最后一条权威目录项，用于下一次增量读取。 */
+  cursor: ConversationOutlineCursor | null;
+}
+
+function clearedAtToMs(clearedAt: string | number | null | undefined): number | null {
+  if (typeof clearedAt === 'number' && Number.isFinite(clearedAt)) return clearedAt;
+  if (typeof clearedAt !== 'string' || clearedAt.length === 0) return null;
+  const parsed = Date.parse(clearedAt);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseOutlineCursor(value: unknown): ConversationOutlineCursor | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  // 当前 reader 返回 Unix ms；兼容更老的 HistoryPage 若把时间字段序列化成
+  // ISO 字符串，归一后继续走同一套 keyset 游标，不让目录静默停在第一页。
+  const createdAt =
+    typeof candidate.createdAt === 'number'
+      ? candidate.createdAt
+      : typeof candidate.createdAt === 'string'
+        ? Date.parse(candidate.createdAt)
+        : Number.NaN;
+  if (!Number.isFinite(createdAt) || typeof candidate.id !== 'string') {
+    return null;
+  }
+  return {
+    createdAt,
+    id: candidate.id,
+    ...(typeof candidate.rowid === 'number' &&
+    Number.isInteger(candidate.rowid) &&
+    candidate.rowid > 0
+      ? { rowid: candidate.rowid }
+      : {}),
+  };
+}
+
+function parseOutlinePage(value: unknown): {
+  rows: unknown[];
+  nextCursor: ConversationOutlineCursor | null;
+  hasMore: boolean;
+} {
+  // A remote invoke normally returns the unwrapped result. Accept the wrapped
+  // form too so a mixed-version relay can fail soft instead of wedging the rail.
+  const unwrapped =
+    value &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    'result' in value &&
+    !('items' in value)
+      ? (value as { result?: unknown }).result
+      : value;
+  if (!unwrapped || typeof unwrapped !== 'object' || Array.isArray(unwrapped)) {
+    throw new Error('Invalid conversation outline response');
+  }
+  const page = unwrapped as Record<string, unknown>;
+  if (!Array.isArray(page.items)) {
+    throw new Error('Invalid conversation outline items');
+  }
+  return {
+    rows: page.items,
+    nextCursor: parseOutlineCursor(page.nextCursor),
+    hasMore: page.hasMore === true,
+  };
+}
+
+function cursorFromOutlineEntry(entry: ConversationOutlineEntry): ConversationOutlineCursor {
+  return {
+    createdAt: entry.createdAt,
+    id: entry.messageId,
+    ...(entry.rowid !== undefined ? { rowid: entry.rowid } : {}),
+  };
+}
+
+/**
+ * Read a lightweight turn-index range and return its authoritative tail cursor.
+ *
+ * 首次调用从 null 开始并读完所有页；后续调用传入上次的 cursor，只会读取
+ * 该 user turn 之后的尾部。分页仍然逐页推进，不能把一页是否已满当成“没有
+ * 隐藏行”的依据，否则旧主机的兼容投影会漏掉真正的目录项。
+ */
+export async function listConversationOutlinePageFor(
+  sessionId: string,
+  clearedAt?: string | number | null,
+  options?: ListConversationOutlineOptions,
+): Promise<ConversationOutlineLoadResult> {
+  // 只需 sticky 解析：它内部第一步就是 getSessionDeviceId（stickySessionOrigin.ts），
+  // 再 `?? getSessionDeviceId(...)` 是永远命中不到的死分支。
+  const deviceId = getStickySessionDeviceId(sessionId);
+  const clearMs = clearedAtToMs(clearedAt);
+  const loadPage = (request: ConversationOutlineHistoryRequest): Promise<unknown> => {
+    if (!deviceId) return window.electronAPI.localDb.history.turnIndex(request);
+    return invokeRemote(deviceId, 'local-db:history:messages', [request]);
+  };
+
+  const rows: unknown[] = [];
+  let cursor: ConversationOutlineCursor | null = options?.cursor ?? null;
+  let lastCursor: ConversationOutlineCursor | null = cursor;
+  const seenCursors = new Set<string>();
+  for (let pageNumber = 0; pageNumber < CONVERSATION_OUTLINE_MAX_PAGES; pageNumber += 1) {
+    // 每页之前检查取消。调用方只丢弃结果是不够的：长会话最多 256 页顺序往返，
+    // 远程时每页都过隧道；切会话或连发消息会让多个分页循环同时打满隧道。
+    if (options?.signal?.aborted) break;
+    const request: ConversationOutlineHistoryRequest = {
+      sessionId,
+      workdir: null,
+      fromMs: clearMs === null ? null : clearMs + 1,
+      toMs: null,
+      agentKind: null,
+      roles: ['user'],
+      includeRewound: false,
+      limit: CONVERSATION_OUTLINE_PAGE_SIZE,
+      cursor,
+      order: 'asc',
+      projection: 'turn-index',
+      // Old hosts use this only as a relay-side safety cap; native turn-index
+      // hosts return a precomputed preview and never expose raw content.
+      // 旧主机 regular history 会保留尾部；512 足以覆盖当前隐藏续跑指令，
+      // 同时把兼容降级的单页正文控制在轻量范围内。
+      contentCharLimit: 512,
+    };
+    const page = parseOutlinePage(await loadPage(request));
+    rows.push(...page.rows);
+
+    // 无论本页是否还有下一页，都把已返回的最后一条可见项记成高水位。
+    // 这样最后一页的 nextCursor=null 不会让下一次增量读取退回会话头部。
+    const pageEntries = buildConversationOutline(
+      page.rows.filter(
+        (row): row is Record<string, unknown> =>
+          !!row && typeof row === 'object' && !Array.isArray(row),
+      ),
+    );
+    const lastPageEntry = pageEntries.at(-1);
+    if (lastPageEntry) lastCursor = cursorFromOutlineEntry(lastPageEntry);
+    if (!page.hasMore || !page.nextCursor) break;
+    const cursorKey = JSON.stringify(page.nextCursor);
+    if (seenCursors.has(cursorKey)) break;
+    seenCursors.add(cursorKey);
+    cursor = page.nextCursor;
+  }
+  return {
+    entries: buildConversationOutline(
+      rows.filter(
+        (row): row is Record<string, unknown> =>
+          !!row && typeof row === 'object' && !Array.isArray(row),
+      ),
+    ),
+    cursor: lastCursor,
+  };
+}
+
+/** 保留旧调用方的全量读取 API；目录 hook 使用上面的带游标版本。 */
+export async function listConversationOutlineFor(
+  sessionId: string,
+  clearedAt?: string | number | null,
+  options?: ListConversationOutlineOptions,
+): Promise<ConversationOutlineEntry[]> {
+  const result = await listConversationOutlinePageFor(sessionId, clearedAt, options);
+  return result.entries;
+}
+
 /**
  * 订阅形态会话「本会话价值」历史汇总:远程走隧道(否则查控制端空库恒为 0,底部 $ chip
  * 的历史初值永远缺失)。归属用粘滞解析(relay 瞬时重连清空注册表的窗口内不误判为本机,
@@ -288,7 +465,10 @@ export function aroundMessagesFor(
   messageId: string,
   opts?: { radius?: number },
 ): Promise<Message[]> {
-  const deviceId = getSessionDeviceId(sessionId);
+  // around 查询和目录索引属于同一条远程历史读取链路；relay 重连时
+  // registry 可能短暂为空，必须沿用最后已知设备，避免误查控制端空库。
+  // sticky 内部已先查 registry，无需再 `?? getSessionDeviceId(...)` 兜一层。
+  const deviceId = getStickySessionDeviceId(sessionId);
   if (!deviceId) return messageService.around(sessionId, messageId, opts);
   return invokeRemote(deviceId, 'local-db:messages:around', [
     sessionId,
@@ -324,11 +504,10 @@ export function deleteMessageFor(
 ): Promise<MessageDeletionResult> {
   const deviceId = getSessionDeviceId(sessionId);
   if (!deviceId) return window.electronAPI.maker.deleteMessage(sessionId, clientId);
-  return invokeRemote(
-    deviceId,
-    'maker:message:delete',
-    [sessionId, clientId],
-  ) as Promise<MessageDeletionResult>;
+  return invokeRemote(deviceId, 'maker:message:delete', [
+    sessionId,
+    clientId,
+  ]) as Promise<MessageDeletionResult>;
 }
 
 /** interrupted-turn-resume:中断提示「忽略」的显式确认(写一次 last_turn_ended_at),
@@ -348,7 +527,9 @@ export function aroundMessagesByClientIdFor(
   clientId: string,
   opts?: { radius?: number },
 ): Promise<Message[]> {
-  const deviceId = getSessionDeviceId(sessionId);
+  // clientId around 与 messageId around 同属目录/搜索定位链路；relay 重连
+  // 的 origin 短暂为空时仍应沿用最后已知被控端。
+  const deviceId = getStickySessionDeviceId(sessionId);
   if (!deviceId) return messageService.aroundClientId(sessionId, clientId, opts);
   return invokeRemote(deviceId, 'local-db:messages:around-client-id', [
     sessionId,

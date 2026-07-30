@@ -201,6 +201,142 @@ describe('makerApiFor 路由(完整对等会话级操作)', () => {
     expect(localMessages.estimatedSessionValue).toHaveBeenCalledWith('local-sess');
     expect(invoke).not.toHaveBeenCalled();
   });
+
+  it('旧主机返回 ISO cursor 时归一为毫秒并继续读取下一页', async () => {
+    const { invoke } = stubElectron();
+    const firstCreatedAt = '2026-07-27T00:00:01.000Z';
+    const secondCreatedAt = '2026-07-27T00:00:02.000Z';
+    invoke.mockImplementation(async (_device, _channel, args) => {
+      const request = (args as unknown[])[0] as { cursor?: unknown };
+      if (request.cursor === null) {
+        return {
+          items: [
+            {
+              id: 'legacy-1',
+              role: 'user',
+              content: '旧主机第一页',
+              createdAt: firstCreatedAt,
+            },
+          ],
+          nextCursor: { createdAt: firstCreatedAt, id: 'legacy-1' },
+          hasMore: true,
+        };
+      }
+      return {
+        items: [
+          {
+            id: 'legacy-2',
+            role: 'user',
+            content: '旧主机第二页',
+            createdAt: secondCreatedAt,
+          },
+        ],
+        nextCursor: null,
+        hasMore: false,
+      };
+    });
+    const { remoteProjectsStore } = await import('@/features/device-link/remoteProjectsStore');
+    remoteProjectsStore.setDeviceSessions('dev-iso', 'Mac', [sess('remote-iso')]);
+    const { listConversationOutlineFor } = await import('@/lib/makerTransport');
+
+    await expect(listConversationOutlineFor('remote-iso')).resolves.toEqual([
+      {
+        messageId: 'legacy-1',
+        createdAt: Date.parse(firstCreatedAt),
+        preview: '旧主机第一页',
+      },
+      {
+        messageId: 'legacy-2',
+        createdAt: Date.parse(secondCreatedAt),
+        preview: '旧主机第二页',
+      },
+    ]);
+    expect(invoke).toHaveBeenNthCalledWith(2, 'dev-iso', 'local-db:history:messages', [
+      expect.objectContaining({
+        cursor: { createdAt: Date.parse(firstCreatedAt), id: 'legacy-1' },
+      }),
+    ]);
+  });
+
+  it('目录增量读取复用上次尾游标，不从会话头重新扫描', async () => {
+    const { invoke } = stubElectron();
+    const firstCreatedAt = 1_000;
+    const secondCreatedAt = 2_000;
+    invoke.mockImplementation(async (_device, _channel, args) => {
+      const request = (args as unknown[])[0] as { cursor?: unknown };
+      if (request.cursor === null) {
+        return {
+          items: [
+            {
+              id: 'message-1',
+              clientId: 'client-1',
+              role: 'user',
+              preview: '第一轮',
+              createdAt: firstCreatedAt,
+              rowid: 1,
+            },
+          ],
+          nextCursor: null,
+          hasMore: false,
+        };
+      }
+      return {
+        items: [
+          {
+            id: 'message-2',
+            clientId: 'client-2',
+            role: 'user',
+            preview: '第二轮',
+            createdAt: secondCreatedAt,
+            rowid: 2,
+          },
+        ],
+        nextCursor: null,
+        hasMore: false,
+      };
+    });
+    const { remoteProjectsStore } = await import('@/features/device-link/remoteProjectsStore');
+    remoteProjectsStore.setDeviceSessions('dev-incremental', 'Mac', [sess('remote-incremental')]);
+    const { listConversationOutlinePageFor } = await import('@/lib/makerTransport');
+
+    const first = await listConversationOutlinePageFor('remote-incremental');
+    const second = await listConversationOutlinePageFor('remote-incremental', null, {
+      cursor: first.cursor,
+    });
+
+    expect(first.entries.map((entry) => entry.messageId)).toEqual(['message-1']);
+    expect(second.entries.map((entry) => entry.messageId)).toEqual(['message-2']);
+    expect(invoke).toHaveBeenNthCalledWith(2, 'dev-incremental', 'local-db:history:messages', [
+      expect.objectContaining({
+        cursor: { createdAt: firstCreatedAt, id: 'message-1', rowid: 1 },
+      }),
+    ]);
+  });
+
+  it('取消信号一置起就停止翻页，不再继续占用隧道', async () => {
+    const { invoke } = stubElectron();
+    const abort = new AbortController();
+    // 每页都声明还有下一页；若不响应取消，循环会一直打到 256 页上限。
+    invoke.mockImplementation(async () => {
+      abort.abort();
+      return {
+        items: [{ id: 'page-item', role: 'user', content: '一页', createdAt: 1_000 }],
+        nextCursor: { createdAt: 1_000, id: 'page-item', rowid: 1 },
+        hasMore: true,
+      };
+    });
+    const { remoteProjectsStore } = await import('@/features/device-link/remoteProjectsStore');
+    remoteProjectsStore.setDeviceSessions('dev-abort', 'Mac', [sess('remote-abort')]);
+    const { listConversationOutlineFor } = await import('@/lib/makerTransport');
+
+    const entries = await listConversationOutlineFor('remote-abort', null, {
+      signal: abort.signal,
+    });
+
+    // 第一页发出后即被取消：只有 1 次隧道调用，已取回的那页仍然可用。
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(entries).toHaveLength(1);
+  });
 });
 
 describe('drift 守卫:makerTransport 隧道的每个 channel 都在 REMOTE_INVOKE_ALLOWLIST 内', () => {

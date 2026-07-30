@@ -11,6 +11,13 @@ vi.mock('electron', () => ({
   },
 }));
 
+// 真实断言会读构建期注入的 renderer 地址全局，单测里不可用；这里只关心
+// handler 有没有按来源调用它（专项覆盖见 conversationOutlineHistory.test.ts）。
+const assertTrustedAppRendererEvent = vi.fn();
+vi.mock('../../../security/trustedAppRenderer', () => ({
+  assertTrustedAppRendererEvent: (event: unknown) => assertTrustedAppRendererEvent(event),
+}));
+
 import { registerRemoteHistoryIpc } from '../history';
 
 const request = {
@@ -24,6 +31,21 @@ const request = {
   limit: 25,
   cursor: { createdAt: 700, id: 'message-7' },
   order: 'asc' as const,
+};
+
+/**
+ * turn-index 专用请求：把 request fixture 里那几个**本投影不消费**的筛选参数
+ * 归零（agentKind / workdir / includeRewound / roles）。handler 现在会拒掉它们，
+ * 而不是像以前那样静默忽略——这也正是这些字段必须显式写出来的原因。
+ */
+const turnIndexRequest = {
+  ...request,
+  projection: 'turn-index' as const,
+  order: 'asc' as const,
+  agentKind: null,
+  workdir: null,
+  includeRewound: false,
+  roles: ['user'] as const,
 };
 
 describe('local-db:history:messages', () => {
@@ -324,5 +346,104 @@ describe('local-db:history:messages', () => {
     expect(getMessages).toHaveBeenCalledWith(expect.objectContaining({
       cursor: { createdAt: 700, id: 'message-7', rowid: 42 },
     }));
+  });
+
+  it('routes the additive turn-index projection without changing regular history reads', async () => {
+    const getMessages = vi.fn();
+    const getTurnIndex = vi.fn(async () => ({
+      items: [{
+        messageId: 'message-1',
+        clientId: 'client-1',
+        rowid: 7,
+        createdAt: 500,
+        preview: '用户问题',
+      }],
+      nextCursor: null,
+      hasMore: false,
+    }));
+    registerRemoteHistoryIpc({
+      sessionExists: vi.fn(async () => true),
+      getMessages,
+      getTurnIndex,
+    });
+
+    const handler = handlers.get(DL_HISTORY_MESSAGES_CHANNEL);
+    const page = await handler?.({}, turnIndexRequest);
+
+    expect(page).toMatchObject({
+      items: [{ messageId: 'message-1', preview: '用户问题' }],
+      hasMore: false,
+    });
+    expect(getTurnIndex).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: 'session-1',
+      projection: 'turn-index',
+    }));
+    expect(getMessages).not.toHaveBeenCalled();
+  });
+
+  it('rejects a desc turn-index request instead of mis-grouping reply previews', async () => {
+    const sessionExists = vi.fn(async () => true);
+    const getTurnIndex = vi.fn();
+    const getMessages = vi.fn(async () => ({ items: [], nextCursor: null, hasMore: false }));
+    registerRemoteHistoryIpc({ sessionExists, getMessages, getTurnIndex });
+
+    const handler = handlers.get(DL_HISTORY_MESSAGES_CHANNEL);
+    // 回复预览的分组是升序双指针；desc 下范围起点会变成最新一轮，靠后的 turn
+    // 会配到别的 turn 的回复。
+    await expect(
+      handler?.({}, { ...turnIndexRequest, order: 'desc' }),
+    ).rejects.toThrow('[INVALID_PARAMS]');
+    expect(sessionExists).not.toHaveBeenCalled();
+    expect(getTurnIndex).not.toHaveBeenCalled();
+
+    // 常规 history 投影不受影响,仍然支持 desc(MCP / session-reference 在用)。
+    await expect(handler?.({}, { ...request, order: 'desc' })).resolves.toBeDefined();
+    expect(getMessages).toHaveBeenCalledWith(expect.objectContaining({ order: 'desc' }));
+  });
+
+  /**
+   * turn-index 把「只要未 rewind 的 user 行」写死在 SQL 里，不消费这几个从常规 history
+   * 契约继承来的筛选参数。静默忽略会让调用方以为筛选生效了、拿到未筛选结果还不知道，
+   * 所以传了就拒。contentCharLimit 不在此列——它对旧被控端的降级投影仍然有意义。
+   */
+  it('rejects turn-index filters it cannot honor instead of ignoring them', async () => {
+    const sessionExists = vi.fn(async () => true);
+    const getTurnIndex = vi.fn(async () => ({ items: [], nextCursor: null, hasMore: false }));
+    registerRemoteHistoryIpc({ sessionExists, getMessages: vi.fn(), getTurnIndex });
+    const handler = handlers.get(DL_HISTORY_MESSAGES_CHANNEL);
+    const turnIndex = turnIndexRequest;
+
+    for (const override of [
+      { agentKind: 'codex' },
+      { workdir: 'D:\\repo' },
+      { includeRewound: true },
+      { roles: ['assistant'] },
+      { roles: ['user', 'assistant'] },
+    ]) {
+      await expect(handler?.({}, { ...turnIndex, ...override })).rejects.toThrow('[INVALID_PARAMS]');
+    }
+    expect(sessionExists).not.toHaveBeenCalled();
+    expect(getTurnIndex).not.toHaveBeenCalled();
+
+    // 合法组合：roles 允许 ['user'] 与 null(不筛选,与本投影语义等价)；
+    // contentCharLimit 照常放行。
+    for (const override of [{ roles: ['user'] }, { roles: null }, { contentCharLimit: 512 }]) {
+      await expect(handler?.({}, { ...turnIndex, ...override })).resolves.toBeDefined();
+    }
+    expect(getTurnIndex).toHaveBeenCalledTimes(3);
+  });
+
+  it('rejects an unknown projection before touching the database', async () => {
+    const sessionExists = vi.fn();
+    const getMessages = vi.fn();
+    registerRemoteHistoryIpc({ sessionExists, getMessages });
+
+    const handler = handlers.get(DL_HISTORY_MESSAGES_CHANNEL);
+    await expect(handler?.({}, {
+      ...request,
+      projection: 'full-dump',
+    })).rejects.toThrow('[INVALID_PARAMS]');
+    expect(sessionExists).not.toHaveBeenCalled();
+    expect(getMessages).not.toHaveBeenCalled();
   });
 });

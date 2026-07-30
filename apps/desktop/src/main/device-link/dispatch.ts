@@ -27,6 +27,7 @@ import {
   topicForPush,
   DL_SUBSCRIBE_CHANNEL,
   DL_UNSUBSCRIBE_CHANNEL,
+  DL_HISTORY_MESSAGES_CHANNEL,
   DL_MEDIA_FETCH_CHANNEL,
   DL_VOICE_TRANSCRIBE_CHANNEL,
   DL_VOICE_CREDENTIAL_SYNC_CHANNEL,
@@ -99,6 +100,7 @@ const REMOTE_MESSAGE_CHANNELS: ReadonlySet<string> = new Set([
   'local-db:messages:list',
   'local-db:messages:around',
   'local-db:messages:around-client-id',
+  DL_HISTORY_MESSAGES_CHANNEL,
 ]);
 const REMOTE_MESSAGE_CONTENT_LIMIT = 128 * 1024;
 const REMOTE_TOOL_RESULT_CONTENT_LIMIT = 8 * 1024;
@@ -762,7 +764,20 @@ function compactInvokeResultForDeviceLink(
   args?: unknown[],
 ): InvokeResultPayload | null {
   if (!channel || !REMOTE_MESSAGE_CHANNELS.has(channel)) return null;
-  if (!result.ok || !Array.isArray(result.result)) return null;
+  if (!result.ok) return null;
+  if (channel === DL_HISTORY_MESSAGES_CHANNEL) {
+    const request = args?.[0];
+    const projection =
+      request && typeof request === 'object' && !Array.isArray(request)
+        ? (request as Record<string, unknown>).projection
+        : undefined;
+    // The existing history channel also serves MCP callers whose rows contain
+    // full content. Only compact the additive turn-index projection here;
+    // regular history keeps its established payload contract.
+    if (projection !== 'turn-index') return null;
+    return trimTurnIndexPageToFrame(frame, result.result);
+  }
+  if (!Array.isArray(result.result)) return null;
   const compactMessages = result.result.map(compactRemoteMessageForDeviceLink);
   const compact: InvokeResultPayload = {
     ok: true,
@@ -785,6 +800,71 @@ function compactInvokeResultForDeviceLink(
     if (fitsInvokeResultFrame(frame, sliced)) return sliced;
   }
   return null;
+}
+
+/**
+ * turn-index 页超帧时，保留能发送出去的最大前缀。
+ *
+ * 不做任何字段转换：本机 handler 返回的已经是轻量目录项（preview / replyPreview
+ * 都在 shared 侧归一过），被控端没有必要再净化一遍自己的产物。
+ *
+ * nextCursor 必须跟着**实际尾项**重算，否则控制端下一页会从原始尾项之后开始，
+ * 跳过被裁掉的那些目录项。
+ */
+function trimTurnIndexPageToFrame(
+  frame: { dst: string; requestId: string },
+  value: unknown,
+): InvokeResultPayload | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const page = value as Record<string, unknown>;
+  if (!Array.isArray(page.items)) return null;
+  const items = page.items;
+  let low = 1;
+  let high = items.length - 1;
+  let best: InvokeResultPayload | null = null;
+  while (low <= high) {
+    const keep = Math.floor((low + high) / 2);
+    const keptItems = items.slice(0, keep);
+    const nextCursor = conversationOutlineCursorFromCompactItem(keptItems[keep - 1]);
+    if (!nextCursor) {
+      high = keep - 1;
+      continue;
+    }
+    const candidate: InvokeResultPayload = {
+      ok: true,
+      result: { ...page, items: keptItems, nextCursor, hasMore: true },
+    };
+    if (fitsInvokeResultFrame(frame, candidate)) {
+      best = candidate;
+      low = keep + 1;
+    } else {
+      high = keep - 1;
+    }
+  }
+  return best;
+}
+
+function conversationOutlineCursorFromCompactItem(
+  value: unknown,
+): { createdAt: number; id: string; rowid?: number } | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const item = value as Record<string, unknown>;
+  const id =
+    typeof item.messageId === 'string'
+      ? item.messageId
+      : typeof item.id === 'string'
+        ? item.id
+        : null;
+  if (!id || typeof item.createdAt !== 'number' || !Number.isFinite(item.createdAt)) {
+    return null;
+  }
+  return {
+    createdAt: item.createdAt,
+    id,
+    ...(typeof item.rowid === 'number' && Number.isInteger(item.rowid) && item.rowid > 0
+      ? { rowid: item.rowid }
+      : {}),
+  };
 }
 
 function sliceRemoteMessageWindowForChannel(

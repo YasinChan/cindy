@@ -64,6 +64,10 @@ import { PlanViewerCard } from '@/components/new-chat/PlanViewerCard';
 import { PlanActionCard } from '@/components/new-chat/PlanActionCard';
 import { InteractionPromptHost } from '@/components/interaction-portal';
 import { MessageStream } from '@/components/chat/MessageStream';
+import {
+  isOptimisticConversationOutlineMessageId,
+  useConversationOutline,
+} from '@/components/chat/useConversationOutline';
 import { ErrorBanner } from '@/components/chat/ErrorBanner';
 import {
   ErrorTailErrorBanner,
@@ -214,6 +218,7 @@ import {
   parseConversationSearchJump,
   type ConversationSearchJump,
 } from '../../../shared/conversationSearchJump';
+import type { ConversationOutlineEntry } from '../../../shared/conversationOutline';
 
 const log = createLogger('CCAgentSessionView');
 // perf-baseline(与 MessageStream / sidebar 的 perf/session-switch 探针同通道):
@@ -497,13 +502,29 @@ export function CCAgentSessionView({
   const [focusedMessageTarget, setFocusedMessageTarget] = useState<{
     clientId: string;
     requestId: number;
+    source: 'search' | 'outline';
   } | null>(null);
-  const requestFocusMessage = useCallback((clientId: string) => {
-    setFocusedMessageTarget((current) => ({
-      clientId,
-      requestId: (current?.requestId ?? 0) + 1,
-    }));
+  /**
+   * 主动定位请求的代数。搜索/目录都可能先异步补齐历史再滚动；
+   * 新的导航一旦开始，旧回调不得再覆盖当前目标或清理新状态。
+   */
+  const focusNavigationGenerationRef = useRef(0);
+  const cancelFocusNavigation = useCallback(() => {
+    // 用户已通过滚动或“回到底部”接管视口时，只需推进代数；在飞的搜索/目录
+    // 请求返回后会命中现有 requestId 校验并静默退出，不再覆盖用户的新位置。
+    focusNavigationGenerationRef.current += 1;
   }, []);
+  const requestFocusMessage = useCallback(
+    (clientId: string, source: 'search' | 'outline' = 'search') => {
+      focusNavigationGenerationRef.current += 1;
+      setFocusedMessageTarget((current) => ({
+        clientId,
+        requestId: (current?.requestId ?? 0) + 1,
+        source,
+      }));
+    },
+    [],
+  );
   const clearSearchJumpState = useCallback(() => {
     if (searchJumpProp !== undefined) {
       onSearchJumpConsumed?.();
@@ -835,6 +856,16 @@ export function CCAgentSessionView({
   }, [session?.status, sessionId, navigate, ownsWindowRoute]);
   const vendorAuthGate = useVendorAuthGate();
 
+  // 会话 / 受控设备切换时作废在飞的定位请求（目录点击是普通回调、没有 effect
+  // cleanup，代数是它唯一的失效机制）。
+  //
+  // 这个 effect 必须声明在下面的搜索跳转 effect **之前**：同一轮 commit 里 effect
+  // 按声明顺序执行，若递增发生在搜索 effect 捕获代数之后，跨会话点击搜索结果时
+  // 响应会被自己的重置作废——既不跳转也不清理搜索态，表现为静默失败。
+  useEffect(() => {
+    focusNavigationGenerationRef.current += 1;
+  }, [remoteDeviceId, sessionId]);
+
   useEffect(() => {
     if (!sessionId || !searchJump) return;
     if (searchJump.sessionId !== sessionId) {
@@ -845,6 +876,9 @@ export function CCAgentSessionView({
       return;
     }
     let cancelled = false;
+    // 搜索请求本身开始时就占用一个新代数；否则两个连续搜索在第二个
+    // around 尚未返回前，第一项仍可能回调并抢走目录/新搜索的焦点。
+    const navigationGeneration = ++focusNavigationGenerationRef.current;
     const currentState = makerChatStore.getSnapshot(sessionId);
     // "目标已在 messages 里"不等于"窗口连续覆盖到它":先前一次补齐失败的跳转会把目标以
     // 孤岛形式 merge 进窗口(它与已加载的尾部之间隔着没加载的历史)。这时若直接 focus 就
@@ -881,7 +915,9 @@ export function CCAgentSessionView({
         : makerChatStore.loadAroundMessage;
     void loadAround(sessionId, searchJump.messageId, { radius: 60 })
       .then((message) => {
-        if (cancelled) return;
+        // 代数校验(目录/连续搜索的抢焦点防护)与上游的 finishWithFallback 收口
+        // 都要保留：前者决定这次回调还算不算数，后者决定拿不到权威行时怎么收场。
+        if (cancelled || navigationGeneration !== focusNavigationGenerationRef.current) return;
         if (message) {
           requestFocusMessage(message.clientId);
           clearSearchJumpState();
@@ -890,7 +926,7 @@ export function CCAgentSessionView({
         finishWithFallback();
       })
       .catch((err) => {
-        if (!cancelled) {
+        if (!cancelled && navigationGeneration === focusNavigationGenerationRef.current) {
           log.warn('Failed to load search hit context:', err);
           finishWithFallback();
         }
@@ -1215,6 +1251,111 @@ export function CCAgentSessionView({
     updateQueueItem,
     chatDisplaySnapshot,
   } = useCCAgentChat(sessionId, handleTitleUpdate, { chatRealtime });
+
+  const conversationOutline = useConversationOutline({
+    sessionId,
+    clearedAt: session?.clearedAt,
+    remoteDeviceId,
+    // 取数条件必须与下面 showConversationOutline 的显示条件一致（少了 messageWidth
+    // 那项——它只是布局就绪信号）。漏掉 !isCompact 会让窄布局下照样分页拉取整份
+    // 目录再丢掉，远程会话每轮 turn 都白走一次隧道。
+    enabled:
+      Boolean(sessionId) &&
+      ownsRoute &&
+      !isCompactRail &&
+      !isCompact &&
+      !isOrcaMode &&
+      historyLoaded &&
+      chatRealtime,
+    messages,
+  });
+  const [resolvedOutlineClientIds, setResolvedOutlineClientIds] = useState<
+    ReadonlyMap<string, string>
+  >(() => new Map());
+  useEffect(() => {
+    setResolvedOutlineClientIds(new Map());
+  }, [remoteDeviceId, sessionId]);
+  const resolvedConversationOutline = useMemo(
+    () =>
+      conversationOutline.map((entry) => {
+        if (entry.clientId) return entry;
+        const clientId = resolvedOutlineClientIds.get(entry.messageId);
+        return clientId ? { ...entry, clientId } : entry;
+      }),
+    [conversationOutline, resolvedOutlineClientIds],
+  );
+  const handleConversationOutlineSelect = useCallback(
+    async (entry: ConversationOutlineEntry) => {
+      if (!sessionId) return;
+      // 目录点击优先级高于尚未完成的搜索补齐：占用一个新代数即可让在飞的搜索
+      // 回调失效（只需加一次——原先先 += 1 再 ++ 是重复的），随后清理搜索态并
+      // 开始目录自身的 around 查询。
+      const requestId = ++focusNavigationGenerationRef.current;
+      if (searchJump) clearSearchJumpState();
+      // 与搜索跳转同一判据：「目标在 messages 里」不等于「窗口连续覆盖到它」。
+      // 目录天生跳得比搜索远，更容易撞上补齐预算而在窗口里留下孤岛；若在这里
+      // 直接 focus 就返回，store 侧的自愈补齐永远不会被触发（#676）。
+      if (
+        entry.clientId &&
+        canFocusWithoutJumpLoad(makerChatStore.getSnapshot(sessionId), entry.clientId)
+      ) {
+        requestFocusMessage(entry.clientId, 'outline');
+        return;
+      }
+
+      // 与搜索跳转同款收口：拿不到权威行时，只要目标**此刻**还渲染在窗口里就直接
+      // focus、不报错（导航到一行已在屏上的消息不需要网络；被控端临时离线时
+      // invokeRemote 会 reject）。必须查实时快照——请求飞行期间远程权威重建可能已
+      // 把那一行移除，那时 focus 一个不存在的 clientId 会白吞掉这次跳转。
+      const focusIfStillInWindow = (): void => {
+        if (!entry.clientId) {
+          toast.error(t('chat.conversationOutline.jumpFailed'));
+          return;
+        }
+        const stillThere = makerChatStore
+          .getSnapshot(sessionId)
+          .messages.some((message) => message.clientId === entry.clientId);
+        if (stillThere) requestFocusMessage(entry.clientId, 'outline');
+        else toast.error(t('chat.conversationOutline.jumpFailed'));
+      };
+
+      try {
+        let target =
+          entry.clientId && isOptimisticConversationOutlineMessageId(entry.messageId)
+            ? await makerChatStore.loadAroundMessageClientId(sessionId, entry.clientId, {
+                radius: 60,
+              })
+            : await makerChatStore.loadAroundMessage(sessionId, entry.messageId, {
+                radius: 60,
+              });
+        if (!target && entry.clientId) {
+          // 新旧被控端的 around-message 能力上线时间不同：权威 id 失败时，
+          // 再用可选 clientId 兜底，不让目录跳转影响正文正常浏览。
+          target = await makerChatStore.loadAroundMessageClientId(sessionId, entry.clientId, {
+            radius: 60,
+          });
+        }
+        if (requestId !== focusNavigationGenerationRef.current) return;
+        if (!target) {
+          focusIfStillInWindow();
+          return;
+        }
+        setResolvedOutlineClientIds((current) => {
+          if (current.get(entry.messageId) === target.clientId) return current;
+          const next = new Map(current);
+          next.set(entry.messageId, target.clientId);
+          return next;
+        });
+        requestFocusMessage(target.clientId, 'outline');
+      } catch (error) {
+        if (requestId !== focusNavigationGenerationRef.current) return;
+        log.warn('Failed to load conversation outline target:', error);
+        focusIfStillInWindow();
+      }
+    },
+    [clearSearchJumpState, requestFocusMessage, searchJump, sessionId, t],
+  );
+
   // 展示引擎可乐观跟随 intent；真实 event reducer 仍只读 store.agentKind。
   const displayAgentKind =
     agentSwitchIntent?.target ?? (session?.agentKind === 'codex' ? 'codex' : 'claude-code');
@@ -2768,6 +2909,19 @@ export function CCAgentSessionView({
       contentWidth={messageWidth}
       focusMessageClientId={focusedMessageTarget?.clientId ?? null}
       focusMessageRequestId={focusedMessageTarget?.requestId ?? 0}
+      focusMessageSource={focusedMessageTarget?.source ?? 'search'}
+      conversationOutline={resolvedConversationOutline}
+      showConversationOutline={
+        ownsRoute &&
+        !isCompactRail &&
+        !isOrcaMode &&
+        !isCompact &&
+        historyLoaded &&
+        chatRealtime &&
+        messageWidth > 0
+      }
+      onConversationOutlineSelect={handleConversationOutlineSelect}
+      onFocusNavigationCancel={cancelFocusNavigation}
       forkOrigin={forkOrigin}
       onOpenForkOrigin={handleOpenForkOrigin}
     />

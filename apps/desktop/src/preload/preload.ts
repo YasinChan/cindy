@@ -99,6 +99,10 @@ import type {
   DesktopLoginActionResult,
 } from '../shared/authIpc';
 import { BILLING_INVOKE, type BillingRendererApi } from '../shared/billing';
+import type {
+  ConversationOutlineHistoryPage,
+  ConversationOutlineHistoryRequest,
+} from '../shared/conversationOutline';
 
 // Codex 元 IPC 全部升级到 maker.* (agentKind 参数化), preload 不再 import vendor/codex/ipcChannels。
 //   auth      → maker:auth:*(agentKind)
@@ -3424,6 +3428,24 @@ contextBridge.exposeInMainWorld('electronAPI', {
     conversations: {
       search: (request: unknown): Promise<unknown> =>
         ipcRenderer.invoke('local-db:conversations:search', request),
+    },
+    history: {
+      /**
+       * 只读的轻量对话大纲投影。固定走已有 history channel，不把通用
+       * ipcRenderer.invoke 暴露给 renderer，也不跨进程传完整工具输出。
+       *
+       * projection 在这里**写死**而不是照抄入参：这个方法按用途命名为
+       * turnIndex，就不能让调用方改成 'messages' 从同一个口子取回完整历史行
+       * （含正文与工具输出）——preload 是最小权限桥，方法名承诺的范围必须由
+       * 实现强制，不能只靠类型约束。
+       */
+      turnIndex: (
+        request: ConversationOutlineHistoryRequest,
+      ): Promise<ConversationOutlineHistoryPage> =>
+        ipcRenderer.invoke('local-db:history:messages', {
+          ...request,
+          projection: 'turn-index',
+        }),
     },
     recentWorkdirs: {
       /** 列出"最近工作目录"按 lastUsedAt desc;sessions 归档/删除不影响本表。 */
