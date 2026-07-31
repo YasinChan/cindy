@@ -211,10 +211,12 @@ describe('conversation outline history projection', () => {
    * 这一整条链路，因为缺陷正是在这个调用点暴露的（Codex review 第二轮）。
    */
   it('正文是 JSON 字面量的提问不会从投影里消失', async () => {
-    sqlite = createDb();
+    const db = (sqlite = createDb());
     const literals = ['{"cmd":"build"}', '[1,2,3]', '{}', '[]'];
     literals.forEach((literal, index) => {
-      insertMessage(sqlite, { id: `json-${index}`, content: literal, createdAt: 3_000 + index });
+      // 用局部的 db 而不是模块级 sqlite：后者类型是 `Database | null`，
+      // 在回调里拿不到外层的类型收窄。
+      insertMessage(db, { id: `json-${index}`, content: literal, createdAt: 3_000 + index });
     });
 
     const page = await readPage(outlineRequest({ limit: 10 }));

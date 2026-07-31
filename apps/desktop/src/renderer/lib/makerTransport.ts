@@ -449,7 +449,18 @@ export async function listConversationOutlinePageFor(
       ),
     );
     const lastPageEntry = pageEntries.at(-1);
-    if (lastPageEntry) lastCursor = cursorFromOutlineEntry(lastPageEntry);
+    if (lastPageEntry) {
+      lastCursor = cursorFromOutlineEntry(lastPageEntry);
+    } else if (page.nextCursor) {
+      // 本页一条可见项都没有（旧被控端返回普通 HistoryPage 时，整段可能全是 UI trigger /
+      // autoResume / steer / 附件-only 这类隐藏 user 行，由客户端过滤）。此时也必须推进
+      // 高水位，否则下一次增量读取会从同一位置把这段重扫一遍——远程会话里就是反复占用
+      // 隧道。本页所有原始行都已消费完，推进到 page.nextCursor 不会跳过任何可见项。
+      //
+      // 有可见项时仍取最后一条可见项而非 page.nextCursor：这样最多只重扫本页尾部那几行
+      // 隐藏行（有界），换来的是高水位始终落在一个真实目录项上，便于对账与排查。
+      lastCursor = page.nextCursor;
+    }
     if (!page.hasMore || !page.nextCursor) break;
     const cursorKey = JSON.stringify(page.nextCursor);
     if (seenCursors.has(cursorKey)) break;

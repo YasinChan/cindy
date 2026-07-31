@@ -202,6 +202,48 @@ describe('makerApiFor 路由(完整对等会话级操作)', () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
+  /**
+   * 旧被控端返回的是普通 HistoryPage，隐藏 user 行（UI trigger / autoResume / steer /
+   * 附件-only）由客户端过滤。若某一段增量范围整页都是隐藏行，高水位游标原先不前进，
+   * 下一次增量读取会从同一位置把这段重扫一遍——远程会话里这是反复占用隧道的流量。
+   * 隐藏段应当只扫一次：本页没有任何可见项时，用 page.nextCursor 推进高水位。
+   *
+   * 原生 turn-index 投影不会走到这里（main 侧服务端就过滤了隐藏行，items 为空时
+   * hasMore 必为 false），所以这条只对降级路径成立。
+   */
+  it('旧主机整页都是隐藏行时高水位仍前进，不重扫同一段', async () => {
+    const { invoke } = stubElectron();
+    const hiddenPageCursor = { createdAt: 9_000, id: 'hidden-last' };
+    invoke.mockImplementation(async () => ({
+      items: [
+        { id: 'h1', role: 'user', content: '[UI_ACTION_TRIGGER] continue', createdAt: 8_001 },
+        {
+          id: 'h2',
+          role: 'user',
+          content: 'resumed',
+          agentMeta: { autoResume: true },
+          createdAt: 8_002,
+        },
+        { id: 'h3', role: 'user', content: { text: '', images: [{ src: 'x' }] }, createdAt: 8_003 },
+      ],
+      nextCursor: hiddenPageCursor,
+      hasMore: false,
+    }));
+    const { remoteProjectsStore } = await import('@/features/device-link/remoteProjectsStore');
+    remoteProjectsStore.setDeviceSessions('dev-hidden', 'Mac', [sess('remote-hidden')]);
+    const { listConversationOutlinePageFor } = await import('@/lib/makerTransport');
+
+    const startCursor = { createdAt: 1_000, id: 'old-visible' };
+    const result = await listConversationOutlinePageFor('remote-hidden', undefined, {
+      cursor: startCursor,
+    });
+
+    // 一条可见项都没有 —— 但高水位必须已经越过这段隐藏行。
+    expect(result.entries).toEqual([]);
+    expect(result.cursor).toEqual(hiddenPageCursor);
+    expect(result.cursor).not.toEqual(startCursor);
+  });
+
   it('旧主机返回 ISO cursor 时归一为毫秒并继续读取下一页', async () => {
     const { invoke } = stubElectron();
     const firstCreatedAt = '2026-07-27T00:00:01.000Z';
