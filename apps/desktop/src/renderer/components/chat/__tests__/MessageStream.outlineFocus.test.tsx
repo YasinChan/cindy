@@ -91,9 +91,16 @@ vi.mock('../usePrevUserMessageInView', () => ({
   }),
 }));
 
-vi.mock('../useNavigationKeyListener', () => ({
-  useNavigationKeyListener: () => undefined,
-}));
+// 用真实实现:本文件有用例依赖「完整导航键集合都作废在飞的定位」这条行为，
+// mock 成空实现会让那条断言永远通过（它测不到任何东西）。
+// 只保留同一份 NAVIGATION_KEYS 作为单一信息源。
+vi.mock('../useNavigationKeyListener', async () => {
+  const actual =
+    await vi.importActual<typeof import('../useNavigationKeyListener')>(
+      '../useNavigationKeyListener',
+    );
+  return actual;
+});
 
 import { MessageStream } from '../MessageStream';
 
@@ -316,6 +323,46 @@ describe('MessageStream outline focus', () => {
     (scrollRoot as HTMLElement).scrollTop = 400;
     fireEvent.scroll(scrollRoot as HTMLElement);
     expect(onFocusNavigationCancel).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * 回归：**完整**导航键集合都算接管，不只是向上的那三个。
+   *
+   * 原先只有 HISTORY_NAVIGATION_KEYS（PageUp / ArrowUp / Home）作废在飞的定位，
+   * 而跳转抑制解除走的是 NAVIGATION_KEYS（多了 PageDown / ArrowDown / End）。
+   * 同一个按键在两套机制里一个算接管一个不算，于是用户按向下键接管时代数没递增，
+   * 慢速远程 around 返回后仍会把视口拽回旧目标（Codex review）。
+   *
+   * 另一半：焦点在输入框里时按方向键只是移动光标，不该作废跳转。
+   */
+  it('向下的导航键同样取消定位，输入框内的方向键不取消', () => {
+    const onFocusNavigationCancel = vi.fn();
+    const { container } = render(
+      <MessageStream
+        sessionId="session-outline-navkeys"
+        workingDir="/tmp/project"
+        messages={buildMessages(10)}
+        onFocusNavigationCancel={onFocusNavigationCancel}
+      />,
+    );
+
+    let expected = 0;
+    for (const key of ['PageDown', 'ArrowDown', 'End', 'PageUp', 'ArrowUp', 'Home']) {
+      fireEvent.keyDown(window, { key });
+      expected += 1;
+      expect(onFocusNavigationCancel).toHaveBeenCalledTimes(expected);
+    }
+
+    // 非导航键不算。
+    fireEvent.keyDown(window, { key: 'a' });
+    expect(onFocusNavigationCancel).toHaveBeenCalledTimes(expected);
+
+    // 焦点在可编辑目标里：方向键只是移动光标，不作废跳转。
+    const input = document.createElement('input');
+    container.appendChild(input);
+    input.focus();
+    fireEvent.keyDown(input, { key: 'ArrowDown' });
+    expect(onFocusNavigationCancel).toHaveBeenCalledTimes(expected);
   });
   /**
    * 回归：目录跳转期间 auto-follow 不得把视口钉回底部。

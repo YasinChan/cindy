@@ -30,15 +30,20 @@ export const NAVIGATION_KEYS: ReadonlySet<string> = new Set([
 /**
  * 监听 window keydown,任一 NAVIGATION_KEYS 触发时调用 onNavKey。
  * onNavKey 用 ref 持有,避免每次 render 重新挂 listener。
+ *
+ * 回调收到原始事件,以便各消费方按自己的需要加守卫（例如"焦点在输入框里就不算
+ * 滚动意图"）。不在这里统一判：key 集合是本模块的单一信息源,而"什么算接管"
+ * 各处口径不同——抑制解除对输入框里的方向键是宽松的（既有行为），而作废在飞的
+ * 跳转定位不该被打字触发。零参回调仍然合法,老调用点无需改动。
  */
-export function useNavigationKeyListener(onNavKey: () => void): void {
+export function useNavigationKeyListener(onNavKey: (event: KeyboardEvent) => void): void {
   const cbRef = useRef(onNavKey);
   cbRef.current = onNavKey;
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (NAVIGATION_KEYS.has(e.key)) {
-        cbRef.current();
+        cbRef.current(e);
       }
     };
     window.addEventListener('keydown', handler);

@@ -3008,7 +3008,8 @@ export function MessageStream({
       if (event.defaultPrevented) return;
       if (!HISTORY_NAVIGATION_KEYS.has(event.key)) return;
       if (isEditableKeyboardTarget(event.target)) return;
-      cancelFocusNavigationForUserTakeover();
+      // 作废在飞的定位由 handleNavigationKey 统一负责（它覆盖完整导航键集合、
+      // 守卫相同），这里不再重复调用。
       clearChipJumpSuppression();
       const el = scrollRef.current;
       if (
@@ -3023,13 +3024,24 @@ export function MessageStream({
     return () => {
       window.removeEventListener('keydown', onHistoryNavigationKey);
     };
-  }, [
-    clearChipJumpSuppression,
-    cancelFocusNavigationForUserTakeover,
-    triggerUserIntentFill,
-    unpinAutoFollowForUserUpIntent,
-  ]);
-  useNavigationKeyListener(clearChipJumpSuppression);
+  }, [clearChipJumpSuppression, triggerUserIntentFill, unpinAutoFollowForUserUpIntent]);
+  // 导航键的**完整**集合都算用户接管。原先只有 HISTORY_NAVIGATION_KEYS
+  // （PageUp / ArrowUp / Home）作废在飞的定位，而抑制解除走的是这里的
+  // NAVIGATION_KEYS（多了 PageDown / ArrowDown / End）——同一个按键在两套机制里
+  // 一个算接管一个不算，于是按向下键接管时代数没递增，慢速远程 around 返回后
+  // 仍会把视口拽回旧目标（Codex review）。两者现在用同一套 key 判据。
+  //
+  // 抑制解除保持既有的宽松口径（输入框里按方向键也解除）；作废定位则跳过可编辑
+  // 目标——在输入框里移动光标不是"想接管消息列表"。
+  const handleNavigationKey = useCallback(
+    (event: KeyboardEvent) => {
+      clearChipJumpSuppression();
+      if (isEditableKeyboardTarget(event.target)) return;
+      cancelFocusNavigationForUserTakeover();
+    },
+    [cancelFocusNavigationForUserTakeover, clearChipJumpSuppression],
+  );
+  useNavigationKeyListener(handleNavigationKey);
 
   const pinToBottom = useCallback(() => {
     const el = scrollRef.current;
