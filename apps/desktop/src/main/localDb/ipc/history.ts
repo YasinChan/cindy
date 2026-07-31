@@ -20,6 +20,7 @@ import { getDbClient } from '../client/current';
 import { isDeviceLinkInvoke } from '../../device-link/invoke-context';
 import { assertTrustedAppRendererEvent } from '../../security/trustedAppRenderer';
 import { messages, sessions } from '../schema';
+import { readLatestSessionTerminal, type SessionTerminalHint } from '../sessionTerminal';
 import { requireObject, requireString, throwIpcError } from '../../utils/ipcValidate';
 import {
   conversationOutlineEntryFromRow,
@@ -65,6 +66,8 @@ export interface RemoteHistoryMessagesRequest {
 export interface RemoteHistoryIpcDeps {
   sessionExists(sessionId: string): Promise<boolean>;
   getMessages(params: GetMessagesParams): ReturnType<typeof getMessagesForHistory>;
+  readTerminal(sessionId: string, clearedAt: number | null): Promise<SessionTerminalHint | undefined>;
+  /** 可选:turn-index 投影不经过 getMessages / readTerminal,见下方 handler。 */
   getTurnIndex?: (request: RemoteHistoryMessagesRequest) => Promise<ConversationOutlineHistoryPage>;
 }
 
@@ -631,16 +634,19 @@ async function getTurnIndexPage(
   }
 }
 
+const defaultSessionExists = async (sessionId: string): Promise<boolean> => {
+  const rows = await getDbClient().drizzle
+    .select({ id: sessions.id })
+    .from(sessions)
+    .where(eq(sessions.id, sessionId))
+    .limit(1);
+  return rows.length > 0;
+};
+
 const defaultDeps: RemoteHistoryIpcDeps = {
-  async sessionExists(sessionId) {
-    const rows = await getDbClient()
-      .drizzle.select({ id: sessions.id })
-      .from(sessions)
-      .where(eq(sessions.id, sessionId))
-      .limit(1);
-    return rows.length > 0;
-  },
+  sessionExists: defaultSessionExists,
   getMessages: getMessagesForHistory,
+  readTerminal: readLatestSessionTerminal,
   getTurnIndex: getTurnIndexPage,
 };
 
@@ -677,9 +683,21 @@ export function registerRemoteHistoryIpc(deps: RemoteHistoryIpcDeps = defaultDep
       cursor: request.cursor,
       order: request.order,
     });
+    // 终态标记与页面读取在同一次 handler 调用内完成:跨设备调用方拿到的
+    // terminal 与消息快照来自同一数据库时刻(与本机解析路径的两查询间隔
+    // 同价),不会出现「历史页读完、再探测时源端已写入更新回合的错误行」
+    // 导致的终态错配。错误正文不出被控端,只回安全标记。
+    // 页面下界是 gte(fromMs),终态探针是 gt(clearedAt)——同一窗口需 fromMs-1。
+    const terminal = await deps.readTerminal(
+      request.sessionId,
+      request.fromMs === null ? null : request.fromMs - 1,
+    );
     const preserveStructuredRoles =
       request.roles === null ||
       request.roles.some((role) => role !== 'user' && role !== 'assistant');
-    return capReferenceHistoryPage(page, request.contentCharLimit, preserveStructuredRoles);
+    return {
+      ...capReferenceHistoryPage(page, request.contentCharLimit, preserveStructuredRoles),
+      terminal: terminal ?? null,
+    };
   });
 }

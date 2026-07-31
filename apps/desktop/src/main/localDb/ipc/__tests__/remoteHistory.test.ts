@@ -18,7 +18,14 @@ vi.mock('../../../security/trustedAppRenderer', () => ({
   assertTrustedAppRendererEvent: (event: unknown) => assertTrustedAppRendererEvent(event),
 }));
 
-import { registerRemoteHistoryIpc } from '../history';
+import { registerRemoteHistoryIpc, type RemoteHistoryIpcDeps } from '../history';
+
+/** Tests default to "no terminal tail"; individual cases override readTerminal. */
+function register(
+  deps: Omit<RemoteHistoryIpcDeps, 'readTerminal'> & Partial<Pick<RemoteHistoryIpcDeps, 'readTerminal'>>,
+): void {
+  registerRemoteHistoryIpc({ readTerminal: async () => undefined, ...deps });
+}
 
 const request = {
   sessionId: 'session-1',
@@ -60,7 +67,7 @@ describe('local-db:history:messages', () => {
       nextCursor: { createdAt: 800, id: 'message-8' },
       hasMore: true,
     }));
-    registerRemoteHistoryIpc({
+    register({
       sessionExists: vi.fn(async () => true),
       getMessages,
     });
@@ -85,7 +92,7 @@ describe('local-db:history:messages', () => {
 
   it('distinguishes an existing empty session from a missing session', async () => {
     const getMessages = vi.fn();
-    registerRemoteHistoryIpc({
+    register({
       sessionExists: vi.fn(async () => false),
       getMessages,
     });
@@ -97,7 +104,7 @@ describe('local-db:history:messages', () => {
 
   it('rejects malformed cursors and out-of-range limits before reading', async () => {
     const getMessages = vi.fn();
-    registerRemoteHistoryIpc({
+    register({
       sessionExists: vi.fn(async () => true),
       getMessages,
     });
@@ -116,7 +123,7 @@ describe('local-db:history:messages', () => {
   });
 
   it('caps source content only when a session-reference caller requests it', async () => {
-    registerRemoteHistoryIpc({
+    register({
       sessionExists: vi.fn(async () => true),
       getMessages: vi.fn(async () => ({
         items: [{
@@ -147,7 +154,7 @@ describe('local-db:history:messages', () => {
   });
 
   it('strips structured content envelopes before relaying capped rows', async () => {
-    registerRemoteHistoryIpc({
+    register({
       sessionExists: vi.fn(async () => true),
       getMessages: vi.fn(async () => ({
         items: [{
@@ -178,7 +185,7 @@ describe('local-db:history:messages', () => {
   });
 
   it('does not mark plain persisted text envelopes as truncated', async () => {
-    registerRemoteHistoryIpc({
+    register({
       sessionExists: vi.fn(async () => true),
       getMessages: vi.fn(async () => ({
         items: [{
@@ -210,7 +217,7 @@ describe('local-db:history:messages', () => {
   });
 
   it('caps plain rows while preserving structured rows in mixed-role reads', async () => {
-    registerRemoteHistoryIpc({
+    register({
       sessionExists: vi.fn(async () => true),
       getMessages: vi.fn(async () => ({
         items: [{
@@ -262,7 +269,7 @@ describe('local-db:history:messages', () => {
   });
 
   it('marks omitted reference metadata as truncated after flattening an envelope', async () => {
-    registerRemoteHistoryIpc({
+    register({
       sessionExists: vi.fn(async () => true),
       getMessages: vi.fn(async () => ({
         items: [{
@@ -298,7 +305,7 @@ describe('local-db:history:messages', () => {
   });
 
   it('drops non-text blocks when compacting structured history arrays', async () => {
-    registerRemoteHistoryIpc({
+    register({
       sessionExists: vi.fn(async () => true),
       getMessages: vi.fn(async () => ({
         items: [{
@@ -334,7 +341,7 @@ describe('local-db:history:messages', () => {
 
   it('forwards a stable rowid history cursor', async () => {
     const getMessages = vi.fn(async () => ({ items: [], nextCursor: null, hasMore: false }));
-    registerRemoteHistoryIpc({
+    register({
       sessionExists: vi.fn(async () => true),
       getMessages,
     });
@@ -361,7 +368,7 @@ describe('local-db:history:messages', () => {
       nextCursor: null,
       hasMore: false,
     }));
-    registerRemoteHistoryIpc({
+    register({
       sessionExists: vi.fn(async () => true),
       getMessages,
       getTurnIndex,
@@ -385,7 +392,7 @@ describe('local-db:history:messages', () => {
     const sessionExists = vi.fn(async () => true);
     const getTurnIndex = vi.fn();
     const getMessages = vi.fn(async () => ({ items: [], nextCursor: null, hasMore: false }));
-    registerRemoteHistoryIpc({ sessionExists, getMessages, getTurnIndex });
+    register({ sessionExists, getMessages, getTurnIndex });
 
     const handler = handlers.get(DL_HISTORY_MESSAGES_CHANNEL);
     // 回复预览的分组是升序双指针；desc 下范围起点会变成最新一轮，靠后的 turn
@@ -409,7 +416,7 @@ describe('local-db:history:messages', () => {
   it('rejects turn-index filters it cannot honor instead of ignoring them', async () => {
     const sessionExists = vi.fn(async () => true);
     const getTurnIndex = vi.fn(async () => ({ items: [], nextCursor: null, hasMore: false }));
-    registerRemoteHistoryIpc({ sessionExists, getMessages: vi.fn(), getTurnIndex });
+    register({ sessionExists, getMessages: vi.fn(), getTurnIndex });
     const handler = handlers.get(DL_HISTORY_MESSAGES_CHANNEL);
     const turnIndex = turnIndexRequest;
 
@@ -436,7 +443,7 @@ describe('local-db:history:messages', () => {
   it('rejects an unknown projection before touching the database', async () => {
     const sessionExists = vi.fn();
     const getMessages = vi.fn();
-    registerRemoteHistoryIpc({ sessionExists, getMessages });
+    register({ sessionExists, getMessages });
 
     const handler = handlers.get(DL_HISTORY_MESSAGES_CHANNEL);
     await expect(handler?.({}, {
@@ -445,5 +452,36 @@ describe('local-db:history:messages', () => {
     })).rejects.toThrow('[INVALID_PARAMS]');
     expect(sessionExists).not.toHaveBeenCalled();
     expect(getMessages).not.toHaveBeenCalled();
+  });
+
+  it('attaches the safe terminal marker computed in the same handler call', async () => {
+    const readTerminal = vi.fn(async () => ({ status: 'error' as const, createdAt: 500 }));
+    register({
+      sessionExists: vi.fn(async () => true),
+      getMessages: vi.fn(async () => ({ items: [], nextCursor: null, hasMore: false })),
+      readTerminal,
+    });
+
+    const handler = handlers.get(DL_HISTORY_MESSAGES_CHANNEL);
+    const page = await handler?.({}, { ...request, fromMs: 100 }) as { terminal: unknown };
+
+    // 页面下界是 gte(fromMs),终态探针是 gt(clearedAt)——同一窗口需 fromMs-1。
+    expect(readTerminal).toHaveBeenCalledWith('session-1', 99);
+    expect(page.terminal).toEqual({ status: 'error', createdAt: 500 });
+  });
+
+  it('normalizes a missing terminal to null and a missing fromMs to a null bound', async () => {
+    const readTerminal = vi.fn(async () => undefined);
+    register({
+      sessionExists: vi.fn(async () => true),
+      getMessages: vi.fn(async () => ({ items: [], nextCursor: null, hasMore: false })),
+      readTerminal,
+    });
+
+    const handler = handlers.get(DL_HISTORY_MESSAGES_CHANNEL);
+    const page = await handler?.({}, { ...request, fromMs: null }) as { terminal: unknown };
+
+    expect(readTerminal).toHaveBeenCalledWith('session-1', null);
+    expect(page.terminal).toBeNull();
   });
 });
