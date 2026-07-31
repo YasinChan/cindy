@@ -251,6 +251,32 @@ describe('mergeConversationOutlineEntries', () => {
     ]);
   });
 
+  /**
+   * 钉住「同 createdAt 同预览」时的一对一配对。
+   *
+   * 这条**不是**新行为：旧写法用 merged.findIndex 扫正在被修改的数组，配对成功的权威项
+   * 会被回填 clientId 从而被 `!candidate.clientId` 自动排除，一对一本来就成立。把逐次
+   * 扫描换成预建索引队列（O(权威×乐观) → O(权威+乐观)）时，这条守住等价性——用队列很
+   * 容易写成「每次都取同一个下标」，那样后者会覆盖前者、前者被静默丢掉。
+   */
+  it('同 createdAt 同预览的两条 legacy 项与两个乐观项一对一配对', () => {
+    const authoritative: ConversationOutlineEntry[] = [
+      { messageId: 'legacy-a', createdAt: 300, preview: 'Same' },
+      { messageId: 'legacy-b', createdAt: 300, preview: 'Same' },
+    ];
+    const optimistic: ConversationOutlineEntry[] = [
+      { messageId: 'client:c1', clientId: 'c1', createdAt: 300, preview: 'Same' },
+      { messageId: 'client:c2', clientId: 'c2', createdAt: 300, preview: 'Same' },
+    ];
+
+    const merged = mergeConversationOutlineEntries(authoritative, optimistic);
+    // 不新增刻度：两个乐观项都配到了权威项。
+    expect(merged).toHaveLength(2);
+    expect(merged.map((entry) => entry.messageId).sort()).toEqual(['legacy-a', 'legacy-b']);
+    // 两个 clientId 都被回填，没有哪一个被静默丢掉。
+    expect(merged.map((entry) => entry.clientId).sort()).toEqual(['c1', 'c2']);
+  });
+
   it('does not collapse distinct old-host turns with the same preview', () => {
     const authoritative: ConversationOutlineEntry[] = [
       {

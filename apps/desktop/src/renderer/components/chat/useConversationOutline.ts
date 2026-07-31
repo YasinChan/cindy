@@ -230,11 +230,33 @@ export function mergeConversationOutlineEntries(
   // 这类行按 createdAt 分组、组内按目录顺序做一对一配对：两侧都以 (createdAt, rowid)
   // 排序，同毫秒组内的第 k 项必然对应同一条 turn。用完即出队，保证一对一。
   const truncatedLegacyQueueByCreatedAt = new Map<number, number[]>();
+  // 未被裁剪的 legacy 项按「createdAt + 预览」预建索引队列。
+  //
+  // 预建而不是循环里逐次 merged.findIndex：旧主机的权威项没有 clientId，于是**每个**
+  // 乐观项都会走到这条匹配，逐次全量扫描是 O(权威项数 × 乐观项数)——上千 turn 的会话
+  // 每次 merge 都要扫上百万次（Copilot review）。
+  //
+  // 与旧写法语义等价，不是行为变更：findIndex 扫的是**正在被修改**的数组，配对成功的
+  // 权威项会被回填 clientId、从而被 `!candidate.clientId` 自动排除，所以一对一本来就
+  // 成立。队列按下标顺序各消费一次，结果相同——变的只有复杂度。
+  //
+  // 两个队列按构造互斥（这里排除 previewTruncated），避免同一个下标被两条路径各消费
+  // 一次。保尾裁剪项的预览是尾部，本就不该被「头部预览完全相同」命中。
+  const legacyExactQueueByKey = new Map<string, number[]>();
+  const legacyExactKey = (createdAt: number, preview: string): string =>
+    `${createdAt}\u0000${preview}`;
   merged.forEach((entry, index) => {
-    if (entry.clientId || entry.previewTruncated !== true) return;
-    const queue = truncatedLegacyQueueByCreatedAt.get(entry.createdAt);
+    if (entry.clientId) return;
+    if (entry.previewTruncated === true) {
+      const queue = truncatedLegacyQueueByCreatedAt.get(entry.createdAt);
+      if (queue) queue.push(index);
+      else truncatedLegacyQueueByCreatedAt.set(entry.createdAt, [index]);
+      return;
+    }
+    const key = legacyExactKey(entry.createdAt, entry.preview);
+    const queue = legacyExactQueueByKey.get(key);
     if (queue) queue.push(index);
-    else truncatedLegacyQueueByCreatedAt.set(entry.createdAt, [index]);
+    else legacyExactQueueByKey.set(key, [index]);
   });
 
   for (const entry of optimistic) {
@@ -245,14 +267,9 @@ export function mergeConversationOutlineEntries(
       // 旧主机权威项没有 clientId：先试「时间 + 预览完全相同」（未被裁剪的短消息走
       // 这条），失败再从截断队列里按顺序取一个。顺序很重要——只有前两级都配不上时
       // 才消耗队列，否则会白占一个槽位、把真正该配对的那条挤成重复刻度。
-      const legacyMatchIndex = merged.findIndex(
-        (candidate) =>
-          !candidate.clientId &&
-          candidate.createdAt === entry.createdAt &&
-          candidate.preview === entry.preview,
-      );
-      if (legacyMatchIndex >= 0) existingIndex = legacyMatchIndex;
-      else existingIndex = truncatedLegacyQueueByCreatedAt.get(entry.createdAt)?.shift();
+      existingIndex =
+        legacyExactQueueByKey.get(legacyExactKey(entry.createdAt, entry.preview))?.shift() ??
+        truncatedLegacyQueueByCreatedAt.get(entry.createdAt)?.shift();
     }
     if (existingIndex !== undefined) {
       // 新主机的权威 clientId 优先；只在 legacy 项缺失时用已加载消息补齐。
