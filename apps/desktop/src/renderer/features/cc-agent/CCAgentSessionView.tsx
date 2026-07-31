@@ -1252,7 +1252,8 @@ export function CCAgentSessionView({
     chatDisplaySnapshot,
   } = useCCAgentChat(sessionId, handleTitleUpdate, { chatRealtime });
 
-  const conversationOutline = useConversationOutline({
+  const { entries: conversationOutline, invalidate: invalidateConversationOutline } =
+    useConversationOutline({
     sessionId,
     clearedAt: session?.clearedAt,
     remoteDeviceId,
@@ -1315,8 +1316,20 @@ export function CCAgentSessionView({
         const stillThere = makerChatStore
           .getSnapshot(sessionId)
           .messages.some((message) => message.clientId === entry.clientId);
-        if (stillThere) requestFocusMessage(entry.clientId, 'outline');
-        else toast.error(t('chat.conversationOutline.jumpFailed'));
+        if (stillThere) {
+          requestFocusMessage(entry.clientId, 'outline');
+          return;
+        }
+        // 既取不到权威行、也不在当前窗口里 —— 这条目录项对应的消息已经在别处（另一个
+        // 窗口 / 被控端）被删掉了，缓存的权威大纲是陈旧的。丢掉重读，让这根刻度消失，
+        // 而不是留在导轨上每次点都失败。
+        //
+        // 之所以是「失败时自愈」而不是提前发现：窗口外的删除在渲染层是不可见的，
+        // removeMessagesByClientIds 的 setState 在目标不在切片时走 unchanged-state 早退，
+        // 既不换 messages 引用也不通知订阅者（详见 useConversationOutline 里 invalidate
+        // 的注释）。
+        invalidateConversationOutline();
+        toast.error(t('chat.conversationOutline.jumpFailed'));
       };
 
       try {
@@ -1353,7 +1366,14 @@ export function CCAgentSessionView({
         focusIfStillInWindow();
       }
     },
-    [clearSearchJumpState, requestFocusMessage, searchJump, sessionId, t],
+    [
+      clearSearchJumpState,
+      invalidateConversationOutline,
+      requestFocusMessage,
+      searchJump,
+      sessionId,
+      t,
+    ],
   );
 
   // 展示引擎可乐观跟随 intent；真实 event reducer 仍只读 store.agentKind。

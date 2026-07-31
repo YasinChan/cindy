@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { renderHook, waitFor } from '@testing-library/react';
+import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ChatMessage } from '@/lib/makerChatStore';
@@ -363,8 +363,64 @@ describe('useConversationOutline 增量读取', () => {
       undefined,
       expect.objectContaining({ cursor: firstCursor }),
     );
-    await waitFor(() => expect(view.result.current).toHaveLength(2));
+    await waitFor(() => expect(view.result.current.entries).toHaveLength(2));
     view.unmount();
+  });
+
+  /**
+   * invalidate() 丢掉缓存、从会话头重读。
+   *
+   * 用途是「已证实缓存陈旧」——窗口外被删掉的 turn 无法靠比对乐观切片发现：
+   * removeMessagesByClientIds 的 setState 在目标不在切片时走 unchanged-state 早退，
+   * 既不换 messages 引用也不通知订阅者，渲染层看不到任何变化（Codex review）。
+   * 所以点击跳转失败、陈旧被证实的那一刻由调用方显式失效。
+   */
+  it('invalidate() 丢掉缓存并从会话头重读', async () => {
+    const cursor = {
+      createdAt: Date.parse('2026-07-27T08:00:00.000Z'),
+      id: 'db-message-1',
+      rowid: 1,
+    };
+    const stale = {
+      messageId: 'db-message-1',
+      clientId: 'turn-1',
+      rowid: 1,
+      createdAt: cursor.createdAt,
+      preview: 'Message turn-1',
+    };
+    loadOutlinePage
+      .mockResolvedValueOnce({ entries: [stale], cursor })
+      // 重读时那条已被别处删掉的 turn 不再返回。
+      .mockResolvedValueOnce({ entries: [], cursor: null });
+
+    const view = renderHook(() =>
+      useConversationOutline({
+        sessionId: 'session-invalidate',
+        enabled: true,
+        messages: [],
+      }),
+    );
+
+    await waitFor(() => expect(loadOutlinePage).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(view.result.current.entries).toHaveLength(1));
+    expect(loadOutlinePage).toHaveBeenNthCalledWith(
+      1,
+      'session-invalidate',
+      undefined,
+      expect.objectContaining({ cursor: null }),
+    );
+
+    act(() => view.result.current.invalidate());
+
+    await waitFor(() => expect(loadOutlinePage).toHaveBeenCalledTimes(2));
+    // 关键:第二次必须从会话头（cursor: null）重读，而不是接着尾游标增量。
+    expect(loadOutlinePage).toHaveBeenNthCalledWith(
+      2,
+      'session-invalidate',
+      undefined,
+      expect.objectContaining({ cursor: null }),
+    );
+    await waitFor(() => expect(view.result.current.entries).toHaveLength(0));
   });
 
   it('删除中间 user turn 时放弃尾游标并重建权威目录', async () => {
@@ -417,7 +473,7 @@ describe('useConversationOutline 增量读取', () => {
         }),
       { initialProps: { currentMessages: messages } },
     );
-    await waitFor(() => expect(view.result.current).toHaveLength(3));
+    await waitFor(() => expect(view.result.current.entries).toHaveLength(3));
 
     view.rerender({ currentMessages: [messages[0], messages[2]] });
     await waitFor(() => expect(loadOutlinePage).toHaveBeenCalledTimes(2));
@@ -428,7 +484,7 @@ describe('useConversationOutline 增量读取', () => {
       undefined,
       expect.objectContaining({ cursor: null }),
     );
-    await waitFor(() => expect(view.result.current).toHaveLength(2));
+    await waitFor(() => expect(view.result.current.entries).toHaveLength(2));
     view.unmount();
   });
 
@@ -476,10 +532,10 @@ describe('useConversationOutline 增量读取', () => {
         }),
       ],
     });
-    await waitFor(() => expect(view.result.current[0]?.replyPreview).toBe('回复还在生成'));
+    await waitFor(() => expect(view.result.current.entries[0]?.replyPreview).toBe('回复还在生成'));
 
     expect(loadOutlinePage).toHaveBeenCalledTimes(1);
-    expect(view.result.current[0]?.replyPreview).toBe('回复还在生成');
+    expect(view.result.current.entries[0]?.replyPreview).toBe('回复还在生成');
     view.unmount();
   });
 });
@@ -578,7 +634,7 @@ describe('useConversationOutline 消息岛', () => {
         island[1],
       ],
     });
-    await waitFor(() => expect(view.result.current).toHaveLength(3));
+    await waitFor(() => expect(view.result.current.entries).toHaveLength(3));
 
     expect(loadOutlinePage).toHaveBeenCalledTimes(1);
     view.unmount();

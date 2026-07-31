@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type { ChatMessage } from '@/lib/makerChatStore';
 import { createLogger } from '@/lib/logger';
@@ -18,6 +18,24 @@ import {
 const log = createLogger('conversation-outline');
 const OPTIMISTIC_MESSAGE_ID_PREFIX = 'client:';
 const EMPTY_OUTLINE_ENTRIES: readonly ConversationOutlineEntry[] = [];
+
+export interface UseConversationOutlineResult {
+  entries: ConversationOutlineEntry[];
+  /**
+   * 丢掉已缓存的权威大纲、从会话头重读。
+   *
+   * 给「已证实缓存陈旧」的场合用：跳转目标既取不到权威行、也不在当前窗口里，说明这条
+   * 目录项对应的消息已经在别处被删掉了。
+   *
+   * 为什么需要显式入口——本 hook 平时靠比对乐观切片（来自 messages）的结构变化来决定
+   * 要不要重读，而**窗口外**的删除看不见：`removeMessagesByClientIds` 的 setState 在
+   * 目标不在切片里时走 unchanged-state 早退，既不换 messages 引用也不通知订阅者，于是
+   * 没有任何一次渲染能让这里察觉。它确实会 bump messagesEpoch，但那个值同样只能在渲染
+   * 时读到。所以退而求其次：不做提前发现，而是在跳转失败——也就是陈旧被证实的那一刻
+   * ——自愈，让那根刻度消失，而不是永远留在导轨上每次点都失败。
+   */
+  invalidate: () => void;
+}
 
 export interface UseConversationOutlineOptions {
   sessionId?: string;
@@ -315,7 +333,7 @@ export function useConversationOutline({
   remoteDeviceId,
   enabled,
   messages,
-}: UseConversationOutlineOptions): ConversationOutlineEntry[] {
+}: UseConversationOutlineOptions): UseConversationOutlineResult {
   const optimisticEntriesRaw = useMemo(
     () => optimisticConversationOutlineFromMessages(messages),
     [messages],
@@ -323,6 +341,12 @@ export function useConversationOutline({
   const optimisticEntriesRef = useRef(optimisticEntriesRaw);
   const userTurnRevisionRef = useRef(0);
   const forceFullReloadRevisionRef = useRef(0);
+  /**
+   * 外部失效入口的代数。必须用 state 而不是 ref：调用方是在事件回调里失效的
+   * （见 invalidate 的注释），bump 一个 ref 不会触发渲染，effect 也就不会重跑。
+   */
+  const [externalReloadRevision, setExternalReloadRevision] = useState(0);
+  const invalidate = useCallback(() => setExternalReloadRevision((value) => value + 1), []);
   if (!outlineEntriesEqual(optimisticEntriesRef.current, optimisticEntriesRaw)) {
     if (!outlineEntryStructureEqual(optimisticEntriesRef.current, optimisticEntriesRaw)) {
       const change = classifyOutlineStructureChange(
@@ -375,7 +399,9 @@ export function useConversationOutline({
   const requestIdRef = useRef(0);
   // 删除、rewind 或新增 user turn 会递增；assistant 的 replyPreview 收尾不递增。
   const userTurnRevision = userTurnRevisionRef.current;
-  const forceFullReloadRevision = forceFullReloadRevisionRef.current;
+  // 两条触发合成一个标量：乐观切片结构性变化（render 阶段 bump ref）与外部显式失效
+  // （事件回调里 bump state）。任一变化都让缓存作废、从会话头重读。
+  const forceFullReloadRevision = forceFullReloadRevisionRef.current + externalReloadRevision;
 
   useEffect(() => {
     const requestId = ++requestIdRef.current;
@@ -490,8 +516,9 @@ export function useConversationOutline({
 
   const authoritative =
     authoritativeState.scopeKey === scopeKey ? authoritativeState.entries : EMPTY_OUTLINE_ENTRIES;
-  return useMemo(
+  const entries = useMemo(
     () => (scopeKey ? mergeConversationOutlineEntries(authoritative, optimisticEntries) : []),
     [authoritative, optimisticEntries, scopeKey],
   );
+  return useMemo(() => ({ entries, invalidate }), [entries, invalidate]);
 }
