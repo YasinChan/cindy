@@ -185,6 +185,40 @@ describe('conversationOutline', () => {
     ).toMatchObject({ messageId: 'legacy-json', preview: '{"cmd":"build"}' });
   });
 
+  /**
+   * DB 投影喂进来的是**原始存库列**，而 user 消息的存法是 JSON.stringify(纯字符串)
+   * （见 localDb/worker/opHandlers/tx.ts 的 stringifyContent）。所以正文是 JSON
+   * 字面量的提问在库里长这样：`"{\"cmd\":\"build\"}"` —— 解一层得到可见文本
+   * `{"cmd":"build"}`，此时**不能再解析一次**，否则解出个没有 text/content 字段的
+   * 对象、预览变空，这条 turn 就从大纲里消失了（Codex review 第二轮）。
+   * 存库列最多只解包一层。
+   */
+  it('存库列里 JSON 字面量的提问只解包一层，不被二次解析吞掉', () => {
+    for (const literal of ['{"cmd":"build"}', '[1,2,3]', '{"a":{"b":1}}', '[]', '{}']) {
+      expect(
+        conversationOutlineEntryFromRow({
+          id: `stored-${literal}`,
+          role: 'user',
+          createdAt: 4_000,
+          content: JSON.stringify(literal),
+        })?.preview,
+      ).toBe(literal);
+    }
+    // 其它存库形态不受影响
+    const cases: Array<[unknown, string]> = [
+      [JSON.stringify({ text: '普通提问', images: [] }), '普通提问'],
+      [JSON.stringify([{ type: 'text', text: '块形态' }]), '块形态'],
+      [JSON.stringify('quoted'), 'quoted'],
+      ['不是 JSON 的裸文本', '不是 JSON 的裸文本'],
+    ];
+    for (const [content, expected] of cases) {
+      expect(
+        conversationOutlineEntryFromRow({ id: 'x', role: 'user', createdAt: 5_000, content })
+          ?.preview,
+      ).toBe(expected);
+    }
+  });
+
   it('回复预览带过来的隐藏续跑指令不渲染', () => {
     expect(
       normalizeConversationOutlineReplyPreview('[UI_ACTION_TRIGGER] continue after error'),

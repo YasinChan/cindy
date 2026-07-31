@@ -128,12 +128,19 @@ function decodeStoredContent(value: unknown): string {
   if (typeof value === 'string') {
     const parsed = parseJsonString(value);
     if (parsed === value) return value;
-    // ChatMessage.content 已经是用户可见字符串；像 "1" / "true" / "null"
-    // 这样的纯文本恰好也是合法 JSON 标量，不能解析后当成无文本丢掉。
-    // 对象/数组和被 JSON 字符串包裹的结构仍继续递归解码。
+    // **只解包一层**。user 消息的存法是 JSON.stringify(纯字符串)（见
+    // localDb/worker/opHandlers/tx.ts 的 stringifyContent），所以解一层拿到的字符串
+    // 就是用户可见文本本身。若再解析一次，正文恰好是 JSON 字面量的提问
+    // （`{"cmd":"build"}`、粘贴的 config、数组字面量——编码场景很常见）会被当成结构化
+    // 内容，解出一个没有 text/content 字段的对象、预览变空，这条 turn 连同它的跳转
+    // 锚点一起从大纲里消失。
+    if (typeof parsed === 'string') return parsed;
+    // 像 "1" / "true" / "null" 这样的纯文本恰好也是合法 JSON 标量，
+    // 不能解析后当成无文本丢掉。
     if (parsed === null || typeof parsed === 'number' || typeof parsed === 'boolean') {
       return value;
     }
+    // 只有对象 / 数组才继续，交给下面两个分支——它们直接取字段、不再递归字符串。
     return decodeStoredContent(parsed);
   }
   if (Array.isArray(value)) {
