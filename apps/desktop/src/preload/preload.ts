@@ -871,6 +871,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
     } => ipcRenderer.sendSync('ghosts:cindy-prefs', id),
     setCindyPref: (id: string, capability: string, model: string | null): Promise<{ overrides: Record<string, string> }> =>
       ipcRenderer.invoke('ghosts:cindy-prefs:set', id, capability, model),
+    /** 派活(errand)每插件配置(插件详情页「AI 代办」卡;sendSync 首帧同帧渲染)。 */
+    errandPrefsSync: (id: string): { config: Record<string, unknown> } =>
+      ipcRenderer.sendSync('ghosts:errand-prefs', id),
+    setErrandConfig: (
+      id: string,
+      config: Record<string, unknown> | null,
+    ): Promise<{ config: Record<string, unknown> }> =>
+      ipcRenderer.invoke('ghosts:errand-prefs:set', id, config),
     pickFile: (): Promise<{ canceled: true } | { filePath: string }> =>
       ipcRenderer.invoke('ghosts:pick-file'),
     inspect: (lizFilePath: string): Promise<{
@@ -3972,6 +3980,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
       agent: 'claude-code' | 'codex';
       baseUrl: string;
       authMethod: 'apiKey' | 'oauth' | 'none';
+      wireProtocol?: import('@cindy/model-providers').ProviderWireProtocol;
       modelsUrl?: string | null;
       apiKey?: string | null;
       headers?: Record<string, string>;

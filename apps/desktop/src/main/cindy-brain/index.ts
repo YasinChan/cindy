@@ -138,6 +138,8 @@ import {
   type CindyVideoParams,
 } from './cindySlot.js';
 import { GhostAgentSlot, type GhostAgentTurnRunner } from './agentSlot.js';
+import { GhostErrandSlot, type GhostErrandRunner } from './errandSlot.js';
+import { readGhostErrandConfig, writeGhostErrandConfig } from './errandPrefsStore.js';
 import { GhostNodeRuntimeBroker } from './nodeRuntimeBroker.js';
 import { GhostPickSlot } from './pickSlot.js';
 import { GhostPreviewSlot } from './previewSlot.js';
@@ -727,6 +729,7 @@ async function reconcileBuiltinGhosts(reason: string): Promise<void> {
         getGhostRuntime().stop(id);
         getGhostNodeRuntimeBroker().stop(id);
         getGhostAgentSlot().clearGhost(id);
+        getGhostErrandSlot().clearGhost(id);
       },
       onApplyStart: () => {
         tipShown = true;
@@ -917,6 +920,33 @@ export function getGhostAgentSlot(): GhostAgentSlot {
 /** maker-ipc 完成初始化后注入真实会话 runner；保持 cindy-brain 不反向依赖它。 */
 export function setGhostAgentTurnRunner(runner: GhostAgentTurnRunner | null): void {
   getGhostAgentSlot().setRunner(runner);
+}
+
+let errandSlotSingleton: GhostErrandSlot | null = null;
+
+/** 派活取件槽单例(agent 槽 errand 加档):资格审/频控/任务表的统一守门点。 */
+export function getGhostErrandSlot(): GhostErrandSlot {
+  if (!errandSlotSingleton) {
+    errandSlotSingleton = new GhostErrandSlot({
+      getGhost: (id) => getGhostManager().list().find((g) => g.manifest.id === id) ?? null,
+      // wait 模式的署名单在途期间替管子那头的 tool-call 续命(同 cindy 槽契约)。
+      holdPipeCall: (ghostId, callId, budgetMs) =>
+        getGhostPipeDispatcher().holdCall(ghostId, callId, budgetMs),
+      releasePipeCall: (ghostId, callId) => getGhostPipeDispatcher().releaseCall(ghostId, callId),
+      log,
+    });
+  }
+  return errandSlotSingleton;
+}
+
+/** maker-ipc 完成初始化后注入真实派活 runner;传 null 用于退出清理。 */
+export function setGhostErrandRunner(runner: GhostErrandRunner | null): void {
+  getGhostErrandSlot().setRunner(runner);
+}
+
+/** 插件展示名(errand 会话默认标题等宿主侧使用;未装返回 null)。 */
+export function getInstalledGhostName(id: string): string | null {
+  return getGhostManager().list().find((g) => g.manifest.id === id)?.manifest.name ?? null;
 }
 
 let nodeRuntimeBrokerSingleton: GhostNodeRuntimeBroker | null = null;
@@ -2007,6 +2037,36 @@ export function getGhostCindySlot(): GhostCindySlot {
       // 在途并发上限:用户级隐藏配置(ghost-cindy-prefs.json 的 inflightLimits),
       // 缺省 null = 不限并发;每单现读,改配置即生效。
       getInflightLimit: (ghostId) => readGhostCindyInflightLimit(ghostId),
+      // 快问快答(text.oneshot):走轻量任务模型链(与会话起标题/任务摘要
+      // 同一条,用户在设置里配置)。动态 import:utility-model 的传递依赖在
+      // 模块顶层读 electron app 路径,静态引入会把这条链拽进所有 import 本
+      // 模块的单测(hook-script-generator 同款做法)。失败面折叠成 slot 层
+      // 的三档 reason;attempts 细节只进日志,不给沙箱探测面。
+      oneshotText: async ({ prompt, maxTokens, timeoutMs }) => {
+        const [{ requestUtilityText }, { getMaker }] = await Promise.all([
+          import('../utility-model/oneShotCandidates.js'),
+          import('../maker-host/index.js'),
+        ]);
+        const r = await requestUtilityText(getMaker(), prompt, { maxTokens, timeoutMs });
+        if (r.ok) {
+          return { ok: true, text: r.text, model: `${r.providerId}/${r.model}` };
+        }
+        log.warn('ghost oneshot_text utility chain failed', {
+          reason: r.reason,
+          attempts: r.attempts.map((a) => `${a.providerId}/${a.model}:${a.reason}`),
+        });
+        if (r.reason === 'no_candidate') {
+          return {
+            ok: false,
+            reason: 'no_candidate',
+            message: '当前没有可用的快速通道模型(用户未配置或凭证不可用),请如实告知用户并优雅降级',
+          };
+        }
+        if (r.reason === 'timeout') {
+          return { ok: false, reason: 'timeout', message: '快问快答超时,请稍后再试' };
+        }
+        return { ok: false, reason: 'failed', message: '快速通道各候选均失败,请稍后再试' };
+      },
       // 管子续命挂钩:同步视频代办(署名单)在途期间替 tool-call 续命,
       // 免得分钟级生成被管子 330s 基础窗口掐掉(任务后台继续烧钱、结果作废)。
       // ghostId 由派发器配对验身:冒用他人在途 callId 不能续命/收短别人的卷。
@@ -2647,6 +2707,7 @@ export async function installOrUpdateMarketGhostPackage(
     runtime.stop(expected.ghostId);
     getGhostNodeRuntimeBroker().stop(expected.ghostId);
     getGhostAgentSlot().clearGhost(expected.ghostId);
+    getGhostErrandSlot().clearGhost(expected.ghostId);
     let result: Awaited<ReturnType<typeof manager.update>>;
     try {
       result = await manager.update(cindyFilePath);
@@ -2714,6 +2775,7 @@ export async function uninstallGhostAndCleanup(
     runtime.stop(id);
     getGhostNodeRuntimeBroker().stop(id);
     getGhostAgentSlot().clearGhost(id);
+    getGhostErrandSlot().clearGhost(id);
     getGhostSubscriptionGateway().dropGhost(id);
     const result = await manager.uninstall(id, { notify: false });
     if ('rejection' in result) throwUninstallError(result.rejection);
@@ -3257,7 +3319,8 @@ export function registerGhostIpc(): void {
   // 代办,返回值即结果)/ card-update(卡槽③供片,cardService 校验链)/
   // notify(系统提示,notifySlot 资格审+限速)/ fs-request(fs 槽代写文件,
   // fsSlot 三档守门)/ agent-request(Agent 新回合,一次性用户票或后台权限
-  // 守门)/ node-request(随包 Node JSON-RPC/MCP stdio 中继)/ pick-request
+  // 守门)/ agent-errand-request(派活取件,agent.errand 加档 + 频控守门)/
+  // node-request(随包 Node JSON-RPC/MCP stdio 中继)/ pick-request
   // (系统级选文件夹,用户亲选即授权)/ preview-request(右侧栏开预览标签,
   // preview.hosts 白名单守门)/ workspace-request(工作区会话入口,亲选或
   // 确认卡授权,判重/创建在 workspaceSlot)。其它类型一律拒。
@@ -3309,6 +3372,13 @@ export function registerGhostIpc(): void {
     // 进入 system prompt。票据、会话归属、模板和后台权限都在 agentSlot。
     if (type === 'agent-request') {
       return getGhostAgentSlot().handleRequest(id, payload);
+    }
+    // agent-errand-request = 派活取件(agent 槽 errand 加档):任务进插件
+    // 专属 errand 会话跑一轮,最终回复文字取回给插件;任务文本同样只进
+    // 普通 user 消息。资格审/频控/任务表在 errandSlot,会话与收口在注入
+    // 的 runner(maker-ipc)。
+    if (type === 'agent-errand-request') {
+      return getGhostErrandSlot().handleRequest(id, payload);
     }
     // node-request 只在 main.js → contextBridge → 主机方向开放。子进程反向
     // JSON-RPC 请求恒被 broker 拒绝，因此 Node 不能绕过 main.js 控制 Cindy。
@@ -3609,6 +3679,28 @@ export function registerGhostIpc(): void {
     return { overrides };
   });
 
+  // ── agent 槽派活(errand)每插件配置(插件详情页「AI 代办」卡)──
+  // 读走 sendSync(与 cindy-prefs 同理:详情页首帧同帧渲染);写走 invoke,
+  // 整卡替换,值域清洗在存储层(errandPrefsStore.normalizeConfig 白名单,
+  // permissionMode 只认 plan/acceptEdits/auto——bypassPermissions 协议上不存在)。
+  // model/providerId 不在此处对目录校验:与 sessions:create 同一信任面
+  // (可信 renderer 配置面),过期值由 errand runner 建会话时按 mapper 兜底。
+  ipcMain.on('ghosts:errand-prefs', (event, ghostId: unknown) => {
+    event.returnValue = {
+      config: typeof ghostId === 'string' ? readGhostErrandConfig(ghostId) : {},
+    };
+  });
+  ipcMain.handle('ghosts:errand-prefs:set', (_event, ghostId: unknown, config: unknown) => {
+    if (typeof ghostId !== 'string' || ghostId.trim().length === 0) {
+      throwIpcError('INVALID_PARAMS', 'ghostId must be a non-empty string');
+    }
+    if (config !== null && (typeof config !== 'object' || Array.isArray(config))) {
+      throwIpcError('INVALID_PARAMS', 'config must be an object or null');
+    }
+    const saved = writeGhostErrandConfig(ghostId, config as Record<string, unknown> | null);
+    return { config: saved };
+  });
+
   ipcMain.handle('ghosts:install', async (event, lizFilePath: unknown, opts: unknown) => {
     assertTrustedAppRendererEvent(event);
     if (typeof lizFilePath !== 'string' || lizFilePath.trim().length === 0) {
@@ -3668,6 +3760,7 @@ export function registerGhostIpc(): void {
     runtime.stop(inspected.manifest.id);
     getGhostNodeRuntimeBroker().stop(inspected.manifest.id);
     getGhostAgentSlot().clearGhost(inspected.manifest.id);
+    getGhostErrandSlot().clearGhost(inspected.manifest.id);
     let result: Awaited<ReturnType<typeof manager.update>>;
     try {
       result = await manager.update(lizFilePath, { expectedPackageSha256 });

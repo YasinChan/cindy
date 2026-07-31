@@ -2779,6 +2779,18 @@ export class CodexAgent extends BaseAgent {
         log.warn('unregisterCodexMcpThreadContext threw', { error: String(e) });
       }
     };
+    const descendantMcpThreadIds = new Set<string>();
+    const registerDescendantCodexMcpContext = (descendantThreadId: string): void => {
+      if (descendantThreadId === threadId || descendantMcpThreadIds.has(descendantThreadId)) return;
+      descendantMcpThreadIds.add(descendantThreadId);
+      registerCodexMcpContext(descendantThreadId);
+    };
+    const unregisterDescendantCodexMcpContexts = (): void => {
+      for (const descendantThreadId of descendantMcpThreadIds) {
+        unregisterCodexMcpContext(descendantThreadId);
+      }
+      descendantMcpThreadIds.clear();
+    };
     function currentApprovalConfig(): CodexPermissionConfig {
       return mapPermissionToCodex(
         mutablePermissionMode,
@@ -5877,6 +5889,16 @@ export class CodexAgent extends BaseAgent {
           eventQueue.push({ type: 'session_id', data: sdkSessionId, source: 'codex' });
         }
       },
+      descendantThreadStarted: (params) => {
+        const childThreadId = params.thread.id;
+        const parentThreadId = params.thread.parentThreadId;
+        if (!parentThreadId || childThreadId === parentThreadId) return;
+        registerDescendantCodexMcpContext(childThreadId);
+        this.deps.registerCodexChildThreadForParent?.({
+          parentThreadId,
+          childThreadId,
+        });
+      },
       turnStarted: (params) => {
         // turn/start RPC 已失败(超时/拒绝)但 daemon 实际已建 turn — 迟到的孤儿
         // turnStarted 不得重新激活已报终态错误的会话 (greptile P1): 立墓碑 +
@@ -7246,6 +7268,7 @@ export class CodexAgent extends BaseAgent {
         closed = true;
         resetUpstreamIdleForTurnEnd();
         unregisterCodexMcpContext(threadId);
+        unregisterDescendantCodexMcpContexts();
         // close 时 buffer 里可能还有等对账的挂起请求 (codex R17 P2):
         // 统一按拒绝释放, 否则 handler 永远悬挂, dispatchServerRequest
         // 永不返回, server 侧请求卡死。
@@ -7409,6 +7432,9 @@ export class CodexAgent extends BaseAgent {
         // host bridge see runtime Orca role/workflow updates by reference.
         Object.assign(vo, patch);
         registerCodexMcpContext(threadId);
+        for (const descendantThreadId of descendantMcpThreadIds) {
+          registerCodexMcpContext(descendantThreadId);
+        }
         log.debug('setVendorOptions', {
           patchKeys: Object.keys(patch),
         });

@@ -1879,6 +1879,70 @@ describe('CodexAgent.startSession developerInstructions', () => {
     await proxyHandle.close();
   });
 
+  it('reports Codex child and descendant threads to the host-owned proxy route registry', async () => {
+    const registerCodexChildThreadForParent = vi.fn();
+    const registerCodexMcpThreadContext = vi.fn();
+    const unregisterCodexMcpThreadContext = vi.fn();
+    const agent = new CodexAgent(createDeps(
+      { systemPrompt: 'HOST PRODUCT PROMPT' },
+      {
+        registerCodexSystemPromptForThread: vi.fn(),
+        registerCodexChildThreadForParent,
+        registerCodexMcpThreadContext,
+        unregisterCodexMcpThreadContext,
+      },
+    ));
+    const host = installFakeHost(agent, undefined, { codexProxyActive: true });
+    const handle = await agent.startSession({
+      sessionId: 'session-child-route',
+      model: 'gpt-5.4',
+      workingDir: '/repo',
+    });
+
+    const handlers = host.getThreadHandlers();
+    if (!handlers?.descendantThreadStarted) {
+      throw new Error('expected descendantThreadStarted handler');
+    }
+    handlers.descendantThreadStarted({
+      thread: {
+        id: 'child-thread-id',
+        parentThreadId: 'start-thread-id',
+      },
+    });
+    handlers.descendantThreadStarted({
+      thread: {
+        id: 'grandchild-thread-id',
+        parentThreadId: 'child-thread-id',
+      },
+    });
+
+    expect(registerCodexChildThreadForParent).toHaveBeenNthCalledWith(1, {
+      parentThreadId: 'start-thread-id',
+      childThreadId: 'child-thread-id',
+    });
+    expect(registerCodexChildThreadForParent).toHaveBeenNthCalledWith(2, {
+      parentThreadId: 'child-thread-id',
+      childThreadId: 'grandchild-thread-id',
+    });
+    expect(registerCodexMcpThreadContext).toHaveBeenNthCalledWith(2, {
+      threadId: 'child-thread-id',
+      sessionId: 'session-child-route',
+      workingDir: '/repo',
+      vendorOptions: {},
+    });
+    expect(registerCodexMcpThreadContext).toHaveBeenNthCalledWith(3, {
+      threadId: 'grandchild-thread-id',
+      sessionId: 'session-child-route',
+      workingDir: '/repo',
+      vendorOptions: {},
+    });
+
+    await handle.close();
+    expect(unregisterCodexMcpThreadContext).toHaveBeenCalledWith('start-thread-id');
+    expect(unregisterCodexMcpThreadContext).toHaveBeenCalledWith('child-thread-id');
+    expect(unregisterCodexMcpThreadContext).toHaveBeenCalledWith('grandchild-thread-id');
+  });
+
   it('omits thread/resume developerInstructions and registers prompt when codex proxy is active', async () => {
     const runtimeConfig = { systemPrompt: 'HOST PRODUCT PROMPT' };
     const userPrompt = [

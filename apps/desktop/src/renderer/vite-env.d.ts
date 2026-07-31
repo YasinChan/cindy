@@ -1124,6 +1124,13 @@ interface ElectronAPI {
       capability: string,
       model: string | null,
     ) => Promise<{ overrides: Record<string, string> }>;
+    /** 派活(errand)每插件配置:首帧同步读(规则 7);config 缺项 = 跟随默认。 */
+    errandPrefsSync: (id: string) => { config: Record<string, unknown> };
+    /** 整卡替换派活配置(null / 空对象 = 全恢复跟随默认);返回清洗后的落盘值。 */
+    setErrandConfig: (
+      id: string,
+      config: Record<string, unknown> | null,
+    ) => Promise<{ config: Record<string, unknown> }>;
     /** 系统文件选择框(.cindy 过滤),只选不装;取消返回 { canceled: true }。 */
     pickFile: () => Promise<{ canceled: true } | { filePath: string }>;
     /** 只验不装:读出清单、签名信任等级与 icon data URL,供确认弹窗展示。 */
@@ -3751,6 +3758,7 @@ interface ElectronAPI {
       agent: 'claude-code' | 'codex';
       baseUrl: string;
       authMethod: 'apiKey' | 'oauth' | 'none';
+      wireProtocol?: import('@cindy/model-providers').ProviderWireProtocol;
       modelsUrl?: string | null;
       apiKey?: string | null;
       headers?: Record<string, string>;
