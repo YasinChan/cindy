@@ -200,6 +200,30 @@ describe('conversation outline history projection', () => {
     expect(JSON.stringify(page)).not.toContain('secret');
   });
 
+  /**
+   * 端到端走真实 SQL 投影：正文本身就是 JSON 字面量的提问必须留在大纲里。
+   *
+   * history.ts 的投影把**原始存库列**（`content: messages.content`）直接交给
+   * conversationOutlineEntryFromRow，而 user 消息的存法是 JSON.stringify(纯字符串)
+   * ——所以库里是「包着 JSON 的 JSON 字符串」。解一层拿到可见文本后若再解析一次，
+   * 就会解出没有 text/content 字段的对象、预览变空，这条 turn 连同跳转锚点一起消失。
+   * 共享函数层面的用例见 shared/__tests__/conversationOutline.test.ts；这条锁住 DB
+   * 这一整条链路，因为缺陷正是在这个调用点暴露的（Codex review 第二轮）。
+   */
+  it('正文是 JSON 字面量的提问不会从投影里消失', async () => {
+    sqlite = createDb();
+    const literals = ['{"cmd":"build"}', '[1,2,3]', '{}', '[]'];
+    literals.forEach((literal, index) => {
+      insertMessage(sqlite, { id: `json-${index}`, content: literal, createdAt: 3_000 + index });
+    });
+
+    const page = await readPage(outlineRequest({ limit: 10 }));
+    expect(page.items.map((item) => item.messageId)).toEqual(
+      literals.map((_, index) => `json-${index}`),
+    );
+    expect(page.items.map((item) => item.preview)).toEqual(literals);
+  });
+
   it('以 rowid 稳定分页同毫秒消息，不因 id 字典序跳项', async () => {
     sqlite = createDb();
     insertMessage(sqlite, { id: 'row-z', content: '第一条', createdAt: 2_000 });

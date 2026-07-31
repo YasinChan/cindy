@@ -571,10 +571,10 @@ async function getTurnIndexPage(
         //    整段搬进 main；而截断的代价只是少显示一条预览（见那边的注释）。
         //  - user 行反过来：判定要过 isSyntheticTriggerText 与"附件-only"（首个非空行
         //    是否为空），截断后若开头恰好是一大段空白，这一 turn 会**从目录里消失**。
-        //    另外这里必须交原始 JSON 串——conversationOutlineEntryFromRow 用
-        //    contentText 解码，与 historyRowDecodedText 对双重编码等冷门形态并不等价，
-        //    而 isTruncatedLegacyRow 的兜底判据是"可见文本以 … 开头"，喂解码后的文本
-        //    会给原生行错打 previewTruncated。
+        //    另外这里必须交**原始 JSON 串**，不能交 historyRowDecodedText 解码后的文本：
+        //    conversationOutlineEntryFromRow 走 decodeStoredContent（只解包一层，见那边
+        //    注释），两者对双重编码这类冷门形态并不等价；而 isTruncatedLegacyRow 的兜底
+        //    判据是"可见文本以 … 开头"，喂解码后的文本会给原生行错打 previewTruncated。
         // 代价是一次性的：user 正文按页读进来随即释放，不过隧道、不进每 token 路径。
         content: messages.content,
         agentMeta: messages.agentMeta,
